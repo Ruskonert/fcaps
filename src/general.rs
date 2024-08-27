@@ -120,7 +120,7 @@ impl TcpOption {
             }
             TcpOption::WindowScale(scale) => vec![0x03, 0x03, *scale],
             TcpOption::SelectiveAcknowledgment(blocks) => {
-                let mut bytes = vec![0x04, 0x02 + 8 * blocks.len() as u8];
+                let mut bytes = vec![0x05, 0x02 + 8 * blocks.len() as u8];
                 for &(start, end) in blocks {
                     bytes.extend_from_slice(&start.to_be_bytes());
                     bytes.extend_from_slice(&end.to_be_bytes());
@@ -133,7 +133,7 @@ impl TcpOption {
                 bytes.extend_from_slice(&ts_echo.to_be_bytes());
                 bytes
             }
-            TcpOption::SACKPermitted => vec![0x05, 0x02], // SACK Permitted
+            TcpOption::SACKPermitted => vec![0x04, 0x02], // SACK Permitted
             TcpOption::Unknown => vec![],
         }
     }

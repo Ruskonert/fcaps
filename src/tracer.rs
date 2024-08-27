@@ -1,4 +1,4 @@
-use rand::{rngs::ThreadRng, thread_rng, Rng};
+use rand::{thread_rng, Rng};
 
 use crate::{
     general::{IPProtocol, TcpFlag},
@@ -68,10 +68,24 @@ impl L4Tracer {
         self.sequence_enabled = enable;
     }
 
+    ///
+    /// Switches the ability to insert padding data into the suffix
+    /// if it falls short of the minimum length of the Ethernet layer.
+    ///
+    /// The minimum required length is typically known to be 60 bytes.
+    ///
     pub fn set_mode_padding(&mut self, enable: bool) {
         self.padding.0 = enable;
     }
 
+    ///
+    /// Switches on the ability to append 4 bytes of FCS (Frame Check Sequence)
+    /// to the end of packets.
+    ///
+    /// FCS is usually removed from the NIC, and the actual payload is
+    /// passed to the OS level. Switching on this feature should be done
+    /// with caution.
+    ///
     pub fn set_mode_fcs(&mut self, enable: bool) {
         self.fcs = enable;
     }
@@ -80,6 +94,13 @@ impl L4Tracer {
         self.fragmented = enable;
     }
 
+    ///
+    /// Determines the minimum length of the Ethernet layer.
+    ///
+    /// The value is usually known to be 60 bytes. Changing this value
+    /// should be done with caution, as it may not work properly with
+    /// other network devices.
+    ///
     pub fn set_mode_padding_min(&mut self, pktlen: usize) {
         self.padding.1 = pktlen;
     }
@@ -100,7 +121,7 @@ impl L4Tracer {
         self.record = enable;
     }
 
-    pub fn session_adv(&mut self) -> &mut Session {
+    pub fn inner(&mut self) -> &mut Session {
         &mut self.inner
     }
 
@@ -110,25 +131,32 @@ impl L4Tracer {
         self.l4_peer_sequence_nonce = thread_rng.gen_range(1..=std::u32::MAX);
     }
 
-    pub fn switch_session(&mut self, rebuild: bool) {
+    ///
+    /// Switch the current owner and peer, and reassemble the packet again.
+    ///
+    pub fn switch_direction(&mut self, rebuild: bool) {
         self.reversed = !self.reversed;
         self.inner.reverse_session(rebuild); // Swapping direction
     }
 
+    ///
+    /// Transmits the 3-way handshake supported by the TCP protocol.
+    /// Other protocols do not perform any function.
+    ///
     pub fn sendp_handshake(&mut self) -> Vec<Vec<u8>> {
         if self.proto == IPProtocol::TCP {
             if self.connected {
                 // NEED TO RESET?
-                self.switch_session(false);
+                self.switch_direction(false);
                 self.sendp_tcp_finish();
-                self.switch_session(false);
+                self.switch_direction(false);
                 self.sendp_tcp_finish();
                 match self.direction() {
                     // prevent re-used port
-                    TracerDirection::Forward => self.session_adv().l4_sport += 1,
+                    TracerDirection::Forward => self.inner().l4_sport += 1,
                     TracerDirection::Backward => {
-                        self.session_adv().l4_dport += 1;
-                        self.switch_session(true); // reset direction because need to handshake owner -> peer.
+                        self.inner().l4_dport += 1;
+                        self.switch_direction(true); // reset direction because need to handshake owner -> peer.
                     }
                 }
             }
@@ -140,14 +168,14 @@ impl L4Tracer {
             self.inner.l4_tcp_sequence = self.l4_owner_sequence_nonce;
             self.inner.l4_tcp_acknowledgment = 0; // init value is zero
             let p1 = self.build_tcp_packet(TcpFlag::Syn.into(), &[]);
-            self.switch_session(false);
+            self.switch_direction(false);
             self.set_mode_fix_l4_tcp_sequence(true);
 
             self.l4_owner_sequence_nonce += 1;
             let p2 = self.build_tcp_packet(TcpFlag::Syn | TcpFlag::Ack, &[]);
 
             self.l4_peer_sequence_nonce += 1;
-            self.switch_session(false);
+            self.switch_direction(false);
 
             self.inner.l4_tcp_sequence = self.l4_peer_sequence_nonce;
             self.inner.l4_tcp_acknowledgment = self.l4_owner_sequence_nonce;
@@ -199,11 +227,11 @@ impl L4Tracer {
 
     ///
     /// Send a packet with application data.
-    /// 
+    ///
     /// An acknowledge packet will be sended when `recv_ack` flag was enabled,
-    /// but that transmission is ignored where `IPProtocol` enum is not 
+    /// but that transmission is ignored where `IPProtocol` enum is not
     /// `IPProtocol::TCP`.
-    /// 
+    ///
     pub fn send(&mut self, with_payload: &[u8], recv_ack: bool) -> Vec<Vec<u8>> {
         let mut vecs: Vec<Vec<u8>> = vec![];
         if self.fragmented {
@@ -219,12 +247,18 @@ impl L4Tracer {
                 if self.proto == IPProtocol::UDP {
                     self.inner.l3_ipv4_iden = thread_rng().gen(); // Set new identification number.
                     self.inner.l3_fragment = (true, 0);
+
                     self.inner.set_mode_automatic_length(false);
-                    unsafe { 
-                        self.inner.modify_l4_udp_length((payload_len + 8) as u16); // included UDP header length
+
+                    unsafe {
+                        self.inner.modify_l4_udp_length((payload_len + 8) as u16);
+                        // included UDP header length
                     }
+
                     self.inner.build(&with_payload[..max_payload_len - 8]);
+
                     self.inner.set_mode_automatic_length(true);
+
                     let result = self.export_packet();
                     if self.record {
                         self.payloads.push(result.clone());
@@ -248,8 +282,7 @@ impl L4Tracer {
                         last = true;
                         if remain_exist {
                             payload_len
-                        }
-                        else {
+                        } else {
                             start_offset + (max_payload_len * (d + 1))
                         }
                     } else {
@@ -261,15 +294,13 @@ impl L4Tracer {
                         IPProtocol::TCP => {
                             let result = if last {
                                 self.send(slice_pl, true)
-                            }
-                            else {
+                            } else {
                                 vec![self.sendp_tcp_ack(slice_pl)]
                             };
                             vecs.extend(result);
                         }
                         IPProtocol::UDP => {
                             self.inner.l3_fragment = (!last, (bottom + 8) as u16);
-                            println!("Fragmented Offset: {:?}", self.inner.l3_fragment);
                             self.inner.build_l3(slice_pl);
                             let result = self.export_packet();
                             if self.record {
@@ -277,12 +308,11 @@ impl L4Tracer {
                             }
                             vecs.push(result);
                         }
-                        _ => panic!()
+                        _ => panic!(),
                     }
                 }
                 return vecs;
-            }
-            else { 
+            } else {
                 // nothing else, just default process.
             }
         }
@@ -303,10 +333,10 @@ impl L4Tracer {
                     }
                 }
                 if recv_ack {
-                    self.switch_session(false);
+                    self.switch_direction(false);
                     let pl2 = self.sendp_tcp_ack(&[]);
                     vecs.push(pl2);
-                    self.switch_session(true);
+                    self.switch_direction(true);
                 }
             }
             IPProtocol::UDP => {
@@ -377,7 +407,7 @@ impl L4Tracer {
         }
         if self.fcs {
             let fcs_value = util::calc_fcs(payload);
-            payload.extend(fcs_value.to_be_bytes());
+            payload.extend(fcs_value.to_le_bytes());
         }
     }
 }

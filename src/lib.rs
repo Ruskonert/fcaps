@@ -7,7 +7,7 @@ mod util;
 #[cfg(test)]
 mod test {
     use crate::{
-        general::{IPProtocol, Layer, TcpFlag},
+        general::{IPProtocol, Layer, TcpFlag, TcpOption},
         pcap::write_pcap,
         session::Session,
         tracer::L4Tracer,
@@ -16,16 +16,39 @@ mod test {
     #[test]
     fn assert_write_pcap() {
         let mut tracer = L4Tracer::new(IPProtocol::TCP, 59230, 502);
-        println!("{:#?}", tracer);
         let result = tracer.sendp_handshake();
         let _ = write_pcap(result, "./new.pcap");
     }
 
     #[test]
+    fn assert_write_pcap_with_tcp_ipv6() {
+        let mut tracer = L4Tracer::new(IPProtocol::TCP, 59230, 502);
+        let session = tracer.inner();
+        session.ip_default(true);
+        let result = tracer.sendp_handshake();
+        let _ = write_pcap(result, "./new_tcp_ipv6.pcap");
+    }
+
+    #[test]
+    fn assert_write_pcap_with_udp_ipv6() {
+        let mut tracer = L4Tracer::new(IPProtocol::UDP, 59230, 502);
+        let session = tracer.inner();
+        session.ip_default(true);
+        tracer.send(&[0x41, 0x41, 0x41], true);
+        let _ = write_pcap(tracer.payloads, "./new_udp_ipv6.pcap");
+    }
+
+    #[test]
     fn assert_write_pcap2() {
         let mut tracer = L4Tracer::new(IPProtocol::TCP, 59230, 502);
-        tracer.set_mode_tcp_checksum(false);
-        
+        let session = tracer.inner();
+        session.assign_tcp_option_with_padding(
+            TcpFlag::Syn.into(),
+            TcpOption::MaximumSegmentSize(1460),
+        );
+        session.assign_tcp_option_with_padding(TcpFlag::Syn.into(), TcpOption::WindowScale(8));
+        session.assign_tcp_option_with_padding(TcpFlag::Syn.into(), TcpOption::SACKPermitted);
+
         for _ in 0..1000 {
             tracer.sendp_handshake();
             tracer.send(&[0x41, 0x41, 0x41], true);
@@ -35,7 +58,7 @@ mod test {
             tracer.send(&[0x41, 0x41, 0x41], true);
             tracer.send(&[0x41, 0x41, 0x41], true);
             tracer.send(&[0x41, 0x41, 0x41], true);
-            tracer.switch_session(false);
+            tracer.switch_direction(false);
             tracer.send(&[0x00, 0x00, 0x00, 0x00, 0x00], true);
             tracer.send(&[0x00, 0x00, 0x00, 0x00, 0x00], true);
         }
@@ -45,16 +68,15 @@ mod test {
     #[test]
     fn assert_udp_fragmented_pcap() {
         let mut tracer = L4Tracer::new(IPProtocol::UDP, 59230, 1234);
-        tracer.set_mode_fragment(true);
-
-        let mut vecs : Vec<u8> = Vec::with_capacity(10000);
-        for _ in 0..10000 {
-            vecs.push(41);
+        let mut vecs: Vec<u8> = Vec::with_capacity(8880);
+        for i in 0..8880 {
+            let k = i % (0x0a as u16);
+            vecs.push(k as u8);
         }
 
         tracer.send(&[0x41, 0x41, 0x41], false);
         tracer.send(&vecs, true);
-        tracer.switch_session(false);
+        tracer.switch_direction(false);
 
         tracer.send(&[0x41, 0x41, 0x41], false);
         tracer.send(&vecs, true);
@@ -62,6 +84,24 @@ mod test {
         println!("{:?}", write_pcap(tracer.payloads, "./new_3.pcap"));
     }
 
+    #[test]
+    fn assert_tcp_segment_pcap() {
+        let mut tracer = L4Tracer::new(IPProtocol::TCP, 59231, 1234);
+        let mut vecs: Vec<u8> = Vec::with_capacity(8880);
+        for i in 0..8880 {
+            let k = i % (0x0a as u16);
+            vecs.push(k as u8);
+        }
+
+        tracer.send(&[0x41, 0x41, 0x41], false);
+        tracer.send(&vecs, true);
+        tracer.switch_direction(false);
+
+        tracer.send(&[0x41, 0x41, 0x41], false);
+        tracer.send(&vecs, true);
+
+        println!("{:?}", write_pcap(tracer.payloads, "./new_4.pcap"));
+    }
 
     #[test]
     fn assert_tcp_payload_vaildation() {

@@ -1,11 +1,10 @@
 use std::{
+    collections::HashMap,
     fmt::Debug,
     io::{Error, ErrorKind},
     net::{Ipv4Addr, Ipv6Addr},
     str::FromStr,
 };
-
-use rand::{thread_rng, Rng};
 
 use crate::{
     general::{IPProtocol, Layer, TcpFlag, TcpOption},
@@ -22,24 +21,56 @@ pub const L3_IPV6_HEADER_SIZE: usize = 40;
 ///
 pub struct PseudoHeader<'a> {
     data: &'a [u8],
+    ipv6: bool,
 }
 
 impl<'a> PseudoHeader<'a> {
     ///
     /// Create instances based on the entire payload corresponding to layers L2 to L4.
     ///
-    pub fn from_payload(payload: &'a [u8]) -> Result<Self, Error> {
-        if payload.len() < L2_ETHERNET_SIZE + L3_IPV4_HEADER_SIZE {
-            Err(Error::new(ErrorKind::Other, "Oops! invaild payload"))
+    pub fn from_payload(payload: &'a [u8], ipv6: bool) -> Result<Self, Error> {
+        if ipv6 {
+            if payload.len() < L2_ETHERNET_SIZE + L3_IPV6_HEADER_SIZE {
+                Err(Error::new(ErrorKind::Other, "Oops! invaild payload"))
+            } else {
+                Ok(Self {
+                    data: payload,
+                    ipv6,
+                })
+            }
         } else {
-            Ok(Self { data: payload })
+            if payload.len() < L2_ETHERNET_SIZE + L3_IPV4_HEADER_SIZE {
+                Err(Error::new(ErrorKind::Other, "Oops! invaild payload"))
+            } else {
+                Ok(Self {
+                    data: payload,
+                    ipv6,
+                })
+            }
         }
     }
+
     ///
     ///
     ///
     fn pseudo(&self, pl: &mut [u8], protocol: u16) {
-        if pl.len() == 12 {
+        // ipv6 & TCP, UDP
+        if pl.len() == 40 {
+            let src_ip_offset = L2_ETHERNET_SIZE + 8;
+            let dst_ip_offset = L2_ETHERNET_SIZE + 24;
+            let src_ip_ptr = &self.data[src_ip_offset..src_ip_offset + 16];
+            let dst_ip_ptr = &self.data[dst_ip_offset..dst_ip_offset + 16];
+            pl[..16].copy_from_slice(src_ip_ptr);
+            pl[16..32].copy_from_slice(dst_ip_ptr);
+            let length: u32 = (self.data.len() - L2_ETHERNET_SIZE - L3_IPV6_HEADER_SIZE)
+                .try_into()
+                .unwrap();
+            pl[32..36].copy_from_slice(&length.to_be_bytes());
+            pl[36..39].copy_from_slice(&[0, 0, 0]);
+            pl[39] = protocol as u8;
+        }
+        // ipv4
+        else if pl.len() == 12 {
             let src_ip_offset = L2_ETHERNET_SIZE + 12;
             let dst_ip_offset = L2_ETHERNET_SIZE + 16;
             let src_ip_ptr = &self.data[src_ip_offset..src_ip_offset + 4];
@@ -52,14 +83,19 @@ impl<'a> PseudoHeader<'a> {
                 .try_into()
                 .unwrap();
             pl[10..12].copy_from_slice(&length.to_be_bytes());
+        } else {
         }
     }
 
     ///
     /// Generates a UDP-based pseudo.
     ///
-    pub fn pseudo_udp(&self) -> [u8; 12] {
-        let mut pseudo_payload = [0; 12];
+    pub fn pseudo_udp(&self) -> Vec<u8> {
+        let mut pseudo_payload = if self.ipv6 {
+            [0; 40].to_vec()
+        } else {
+            [0; 12].to_vec()
+        };
         self.pseudo(&mut pseudo_payload, IPProtocol::UDP.into());
         return pseudo_payload;
     }
@@ -67,8 +103,12 @@ impl<'a> PseudoHeader<'a> {
     ///
     /// Generates a TCP-based pseudo.
     ///
-    pub fn pseudo_tcp(&self) -> [u8; 12] {
-        let mut pseudo_payload = [0; 12];
+    pub fn pseudo_tcp(&self) -> Vec<u8> {
+        let mut pseudo_payload = if self.ipv6 {
+            [0; 40].to_vec()
+        } else {
+            [0; 12].to_vec()
+        };
         self.pseudo(&mut pseudo_payload, IPProtocol::TCP.into());
         return pseudo_payload;
     }
@@ -98,7 +138,7 @@ pub struct Session {
     pub l4_dport: u16,
 
     // TCP material
-    pub l4_tcp_options: Vec<TcpOption>,
+    pub l4_tcp_options: HashMap<u8, Vec<TcpOption>>,
     pub l4_tcp_flags: u8,
     pub l4_tcp_sequence: u32,
     pub l4_tcp_acknowledgment: u32,
@@ -136,7 +176,7 @@ impl Debug for Session {
             .field("l3_ipv6_flow_label", &self.l3_ipv6_flow_label)
             .field("l3_ipv6_hop", &self.l3_ipv6_hop)
             .field("l3_src_ip", &sip)
-            .field("l3_dst_ip",& dip)
+            .field("l3_dst_ip", &dip)
             .field("protocol", &self.protocol)
             .field("l4_sport", &self.l4_sport)
             .field("l4_dport", &self.l4_dport)
@@ -325,6 +365,7 @@ impl Session {
         target.automatic_length = true;
         target.l3_ipv4_ttl = 128;
         target.l3_ipv6_flow_label = 0x12345;
+        target.l3_ipv6_hop = 64;
         target.l3_ipv4_iden = 0xabcd;
         target.l3_fragment = (false, 0);
         target.mtu = 1500;
@@ -346,7 +387,7 @@ impl Session {
     pub fn create_icmp() -> Self {
         let mut target = Self::create_default();
         target.mac_default();
-        target.ip_default();
+        target.ip_default(false);
         target.protocol = IPProtocol::ICMP;
         target.build(&[]);
         target
@@ -355,7 +396,7 @@ impl Session {
     pub fn create_tcp(src_port: u16, dst_port: u16) -> Self {
         let mut target = Self::create_default();
         target.mac_default();
-        target.ip_default();
+        target.ip_default(false);
         target.protocol = IPProtocol::TCP;
         target.l4_sport = src_port;
         target.l4_dport = dst_port;
@@ -371,7 +412,7 @@ impl Session {
     pub fn create_udp(src_port: u16, dst_port: u16) -> Self {
         let mut target = Self::create_default();
         target.mac_default();
-        target.ip_default();
+        target.ip_default(false);
         target.protocol = IPProtocol::UDP;
         target.l4_sport = src_port;
         target.l4_dport = dst_port;
@@ -381,17 +422,22 @@ impl Session {
     // <---------------- :end: Construct ---------------->
 
     // <---------------- :start: Default ---------------->
-    fn mac_default(&mut self) {
+    pub fn mac_default(&mut self) {
         self.l2_src_mac = [0x00, 0x01, 0x33, 0x44, 0x55, 0x66];
         self.l2_dst_mac = [0x00, 0x01, 0x43, 0x54, 0x65, 0x76];
     }
 
-    fn ip_default(&mut self) {
-        let default_src = [192, 168, 0, 1];
-        let default_dst = [192, 168, 0, 100];
+    pub fn ip_default(&mut self, is_ipv6: bool) {
+        if !is_ipv6 {
+            let default_src = [192, 168, 0, 1];
+            let default_dst = [192, 168, 0, 100];
 
-        self.assign_src_ip_raw(&default_src);
-        self.assign_dst_ip_raw(&default_dst);
+            self.assign_src_ip_raw(&default_src);
+            self.assign_dst_ip_raw(&default_dst);
+        } else {
+            self.assign_src_ip("2001:0DB8::1428:57ab");
+            self.assign_dst_ip("2001:0DB8::1428:57ac");
+        }
     }
     // <---------------- :end: Default ---------------->
 
@@ -477,8 +523,41 @@ impl Session {
         return true;
     }
 
-    pub fn assign_tcp_option(&mut self, opt: TcpOption) {
-        self.l4_tcp_options.push(opt);
+    pub fn assign_tcp_option_with_padding(&mut self, tcp_flag: u8, opt: TcpOption) {
+        let options = self.l4_tcp_options.entry(tcp_flag).or_insert(Vec::new());
+        match opt {
+            TcpOption::WindowScale(_) => {
+                options.push(TcpOption::NoOperation);
+                options.push(opt);
+            }
+            TcpOption::Timestamp(_, _) | TcpOption::SACKPermitted => {
+                options.push(TcpOption::NoOperation);
+                options.push(TcpOption::NoOperation);
+                options.push(opt);
+            }
+            TcpOption::SelectiveAcknowledgment(_) => {
+                let vecs = opt.to_bytes();
+                let modular = vecs.len() % 4;
+                if modular > 0 {
+                    for _ in 0..(4 - modular) {
+                        options.push(TcpOption::NoOperation);
+                    }
+                }
+                options.push(opt);
+            }
+            _ => {
+                options.push(opt);
+            }
+        }
+    }
+
+    pub fn assign_tcp_option(&mut self, tcp_flag: u8, opt: TcpOption) {
+        let options = self.l4_tcp_options.entry(tcp_flag).or_insert(Vec::new());
+        options.push(opt);
+    }
+
+    pub fn clear_tcp_option(&mut self) {
+        self.l4_tcp_options.clear();
     }
 
     pub fn assign_dst_mac(&mut self, mac: &str) -> bool {
@@ -505,7 +584,12 @@ impl Session {
                 self.capacity += pl.len();
                 true
             } else {
-                println!("MTU is {}, but payload size is {}, capacity={}", self.mtu, pl.len(), self.capacity);
+                println!(
+                    "MTU is {}, but payload size is {}, capacity={}",
+                    self.mtu,
+                    pl.len(),
+                    self.capacity
+                );
                 false
             }
         } else {
@@ -629,7 +713,7 @@ impl Session {
         let ptr = self.intl[L2_ETHERNET_SIZE..].as_mut_ptr().wrapping_add(6) as *mut u16;
         let flags: u16 = if has_multiple { 1 } else { 0 };
 
-        let ff_value: u16 = ((flags << 13) | ((fragment_offset / 8) & 0x1fff)) & 0xFFFF;
+        let ff_value: u16 = ((flags << 13) | ((fragment_offset / 8) & 0x1FFF)) & 0xFFFF;
         *ptr = ff_value.to_be();
     }
 
@@ -749,8 +833,10 @@ impl Session {
                     self.modify_l3_ip_length(
                         (self.capacity - L2_ETHERNET_SIZE).try_into().unwrap(),
                     );
+
+                    /* The Checksum has only available on IPv4 Header. */
                     if self.ipv4_checksum {
-                        let checksum = util::calc_checksum(self.l3_ptr());
+                        let checksum = util::calc_checksum(&self.l3_ptr()[..L3_IPV4_HEADER_SIZE]);
                         self.modify_l3_ipv4_checksum(checksum);
                     }
                 }
@@ -813,14 +899,6 @@ impl Session {
     #[inline]
     pub unsafe fn modify_l4_tcp_length(&mut self, with_tcp_option: &[u8]) -> usize {
         let ptr = self.l4_mut_unsafe_ptr().as_mut_ptr();
-        // Calculate TCP Header length (default is 20)
-        let mut tcp_options_pl = vec![];
-        if self.l4_tcp_options.len() > 0 {
-            for opt in &self.l4_tcp_options {
-                tcp_options_pl.extend(opt.to_bytes());
-            }
-        }
-
         let length_ptr = ptr.wrapping_add(12);
         let mut current_length = with_tcp_option.len() + 20;
         *length_ptr = if current_length % 4 != 0 {
@@ -897,14 +975,23 @@ impl Session {
                     // Make TCP option payload & modify TCP Header length (default is 20)
                     let mut tcp_options_pl = vec![];
                     if self.l4_tcp_options.len() > 0 {
-                        for opt in &self.l4_tcp_options {
-                            tcp_options_pl.extend(opt.to_bytes());
+                        if let Some(options) = self.l4_tcp_options.get(&self.l4_tcp_flags) {
+                            for opt in options {
+                                tcp_options_pl.extend(opt.to_bytes());
+                            }
                         }
                     }
                     self.modify_l4_tcp_length(&tcp_options_pl);
                     self.modify_l4_tcp_flags(self.l4_tcp_flags);
                     self.modify_l4_tcp_window_size(self.l4_tcp_window_size);
                     self.modify_l4_checksum(0); // initial checksum is zero.
+
+                    //
+                    // if self.l4_tcp_urgent_ptr > 0 {
+                    //     // URG flags need to enable if urgent pointer is more than 0.
+                    //     self.modify_l4_tcp_flags(self.l4_tcp_flags | TcpFlag::Urgent as u8);
+                    // }
+
                     self.modify_l4_tcp_urgent_ptr(self.l4_tcp_urgent_ptr);
 
                     self.capacity += 20; // TCP default Header Length
@@ -920,9 +1007,19 @@ impl Session {
                             let checksum = self.catch_l4_checksum(IPProtocol::TCP);
                             self.modify_l4_checksum(checksum);
                         }
-                        self.modify_l3_ip_length(
-                            (self.capacity - L2_ETHERNET_SIZE).try_into().unwrap(),
-                        );
+
+                        if self.is_ether_ipv4() {
+                            self.modify_l3_ip_length(
+                                (self.capacity - L2_ETHERNET_SIZE).try_into().unwrap(),
+                            );
+                        } else if self.is_ether_ipv6() {
+                            self.modify_l3_ip_length(
+                                (self.capacity - L2_ETHERNET_SIZE - L3_IPV6_HEADER_SIZE)
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                        }
+
                         if self.ipv4_checksum {
                             if self.is_ether_ipv4() {
                                 // need to reset checksum for calculating
@@ -941,17 +1038,33 @@ impl Session {
                     if self.or_insert_payload(with_payload) {
                         self.build_layer = Layer::L4;
                         if self.automatic_length {
-                            self.modify_l4_udp_length(
-                                (self.capacity - L2_ETHERNET_SIZE - L3_IPV4_HEADER_SIZE) as u16,
-                            );
+                            if self.is_ether_ipv4() {
+                                self.modify_l4_udp_length(
+                                    (self.capacity - L2_ETHERNET_SIZE - L3_IPV4_HEADER_SIZE) as u16,
+                                );
+                            } else if self.is_ether_ipv6() {
+                                self.modify_l4_udp_length(
+                                    (self.capacity - L2_ETHERNET_SIZE - L3_IPV6_HEADER_SIZE) as u16,
+                                );
+                            }
                         }
                         if self.transport_checksum {
                             let checksum = self.catch_l4_checksum(IPProtocol::UDP);
                             self.modify_l4_checksum(checksum);
                         }
-                        self.modify_l3_ip_length(
-                            (self.capacity - L2_ETHERNET_SIZE).try_into().unwrap(),
-                        );
+
+                        if self.is_ether_ipv4() {
+                            self.modify_l3_ip_length(
+                                (self.capacity - L2_ETHERNET_SIZE).try_into().unwrap(),
+                            );
+                        } else if self.is_ether_ipv6() {
+                            self.modify_l3_ip_length(
+                                (self.capacity - L2_ETHERNET_SIZE - L3_IPV6_HEADER_SIZE)
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                        }
+
                         if self.ipv4_checksum {
                             if self.is_ether_ipv4() {
                                 // need to reset checksum for calculating
@@ -974,7 +1087,7 @@ impl Session {
     }
 
     fn catch_l4_checksum(&self, protocol: IPProtocol) -> u16 {
-        let ph = PseudoHeader::from_payload(self.l2_ptr()).unwrap();
+        let ph = PseudoHeader::from_payload(self.l2_ptr(), self.is_ether_ipv6()).unwrap();
         let mut vrt_header = match protocol {
             IPProtocol::TCP => ph.pseudo_tcp().to_vec(),
             IPProtocol::UDP => ph.pseudo_udp().to_vec(),
@@ -1017,6 +1130,10 @@ impl Session {
         }
     }
 
+    ///
+    /// Rebuild based on the currently built layer stage.
+    /// To rebuild all layers, use the `build` method,
+    ///
     pub fn rebuild(&mut self, with_payload: &[u8]) {
         match self.build_layer {
             Layer::L1 => {

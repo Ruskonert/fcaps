@@ -1,18 +1,17 @@
 pub fn calc_fcs(data: &[u8]) -> u32 {
-    let poly: u32 = 0x04C11DB7;
     let mut crc: u32 = 0xFFFFFFFF;
-
     for &byte in data {
-        crc ^= (byte as u32) << 24;
+        let current_byte = byte as u32;
+        crc ^= current_byte;
         for _ in 0..8 {
-            if crc & 0x80000000 != 0 {
-                crc = (crc << 1) ^ poly;
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
             } else {
-                crc <<= 1;
+                crc >>= 1;
             }
         }
     }
-    crc ^ 0xFFFFFFFF
+    !crc
 }
 
 pub fn calc_checksum(data: &[u8]) -> u16 {
