@@ -1,3 +1,7 @@
+use std::fs::File;
+use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 pub fn calc_fcs(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFFFFFF;
     for &byte in data {
@@ -5,6 +9,7 @@ pub fn calc_fcs(data: &[u8]) -> u32 {
         crc ^= current_byte;
         for _ in 0..8 {
             if crc & 1 != 0 {
+                // See below: https://reveng.sourceforge.io/crc-catalogue/all.htm#crc.cat.crc-32-iso-hdlc
                 crc = (crc >> 1) ^ 0xEDB88320;
             } else {
                 crc >>= 1;
@@ -28,4 +33,46 @@ pub fn calc_checksum(data: &[u8]) -> u16 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+pub fn write_pcap(payloads: Vec<Vec<u8>>, filename: &str) -> std::io::Result<()> {
+    let mut file = File::create(filename)?;
+
+    // Global Header
+    let global_header = [
+        0xd4, 0xc3, 0xb2, 0xa1, // Magic Number (little endian)
+        0x02, 0x00, // Version Major (2)
+        0x04, 0x00, // Version Minor (4)
+        0x00, 0x00, 0x00, 0x00, // Thiszone (0)
+        0x00, 0x00, 0x00, 0x00, // Sigfigs (0)
+        0xff, 0xff, 0x00, 0x00, // Snaplen (65535)
+        0x01, 0x00, 0x00, 0x00, // Network (Ethernet)
+    ];
+    file.write_all(&global_header)?;
+
+    for payload in payloads {
+        // Current time for packet timestamp
+        let start = SystemTime::now();
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+        let seconds = since_the_epoch.as_secs() as u32;
+        let microseconds = since_the_epoch.subsec_micros();
+
+        // Packet Header
+        let packet_header = [
+            seconds.to_le_bytes(),                // Timestamp seconds
+            microseconds.to_le_bytes(),           // Timestamp microseconds
+            (payload.len() as u32).to_le_bytes(), // Included Length
+            (payload.len() as u32).to_le_bytes(), // Original Length
+        ]
+        .concat();
+
+        file.write_all(&packet_header)?;
+
+        // Packet Data (Payload)
+        file.write_all(&payload)?;
+    }
+
+    Ok(())
 }

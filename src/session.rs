@@ -7,8 +7,7 @@ use std::{
 };
 
 use crate::{
-    general::{IPProtocol, Layer, TcpFlag, TcpOption},
-    util,
+    general::{FragmentInfo, IPProtocol, Layer, TcpFlag, TcpOption}, preset::Preset, util
 };
 
 pub const L2_ETHERNET_SIZE: usize = 14;
@@ -122,11 +121,13 @@ pub struct Session {
     l2_etype: u16,
 
     // L3 material (IPv4, IPv6)
+    pub l3_dsc: u8,
+    pub l3_ecn: u8,
     pub l3_ipv4_iden: u16,
     pub l3_ipv4_ttl: u8,
     pub l3_ipv6_flow_label: u32,
     pub l3_ipv6_hop: u8,
-    pub l3_fragment: (bool, u16), // MF, fragment offset
+    pub l3_fragment: FragmentInfo,
 
     pub l3_src_ip: [u8; 16], // ipv6 support
     pub l3_dst_ip: [u8; 16], // ipv6 support
@@ -140,16 +141,21 @@ pub struct Session {
     // TCP material
     pub l4_tcp_options: HashMap<u8, Vec<TcpOption>>,
     pub l4_tcp_flags: u8,
+    pub l4_tcp_flags_ecn: bool,
     pub l4_tcp_sequence: u32,
     pub l4_tcp_acknowledgment: u32,
     pub l4_tcp_window_size: u16,
     pub l4_tcp_urgent_ptr: u16,
+
+    pub fp: HashMap<u8, Preset>, // flag 0 is undefined (Not TCP case)
 
     // internal management only
     mtu: usize,
 
     src_ip_capacity: u8,
     dst_ip_capacity: u8,
+
+    reverse: bool,
 
     ipv4_checksum: bool,
     transport_checksum: bool,
@@ -229,6 +235,7 @@ impl<'a> Session {
             panic!("Unexpected point")
         }
     }
+
     pub fn l4_ptr(&'a self) -> &'a [u8] {
         if self.build_layer >= Layer::L3 {
             if self.is_ether_ipv4() {
@@ -360,6 +367,7 @@ impl Session {
     // <---------------- :start: Construct ---------------->
     pub fn create_default() -> Self {
         let mut target: Self = Default::default();
+        target.reverse = false;
         target.ipv4_checksum = true;
         target.transport_checksum = true;
         target.automatic_length = true;
@@ -367,8 +375,9 @@ impl Session {
         target.l3_ipv6_flow_label = 0x12345;
         target.l3_ipv6_hop = 64;
         target.l3_ipv4_iden = 0xabcd;
-        target.l3_fragment = (false, 0);
+        target.l3_fragment = (false, false, false, 0);
         target.mtu = 1500;
+        target.protocol = IPProtocol::NONE;
         target.intl = Vec::with_capacity((target.mtu + L2_ETHERNET_SIZE).into());
         for _ in 0..(target.mtu + L2_ETHERNET_SIZE) {
             target.intl.push(0);
@@ -376,11 +385,58 @@ impl Session {
         target
     }
 
+    pub fn from_payload(payload: &[u8]) -> Option<Self> {
+        let mut sess = Self::create_default();
+        if payload.len() >= 14 {
+            sess.l2_src_mac[..].copy_from_slice(&payload[..6]);
+            sess.l2_dst_mac[..].copy_from_slice(&payload[6..12]);
+
+            unsafe {
+                let etype = payload[12..14].as_ptr() as *const u16;
+                match *etype {
+                    // ipv4 or ipv6
+                    0x0800 | 0x86DD => {
+                        sess.l2_etype = *etype;
+                        let offset = Self::from_l3(&mut sess, *etype, &payload[14..]);
+                        if offset > 14 {
+                            Self::from_l4(&mut sess, &payload[offset..]);
+                        }
+                    }
+                    _ => {
+                        sess.l2_etype = *etype;
+                        sess.build_l2(&payload[14..]);
+                    }
+                }
+            }
+            Some(sess)
+        } else {
+            None
+        }
+    }
+
+    fn from_l3(session: &mut Session, etype: u16, payload: &[u8]) -> usize {
+        let mut offset = 14;
+        unsafe {
+            match etype {
+                0x0800 => if session.catch_l3_ip_version_prefix() != (4, 20) {},
+                0x86DD => {}
+                _ => {
+                    unreachable!()
+                }
+            }
+        }
+        offset
+    }
+
+    fn from_l4(session: &mut Session, payload: &[u8]) -> usize {
+        14
+    }
+
     pub fn create_ether(etype: u16) -> Self {
         let mut target = Self::create_default();
         target.mac_default();
         target.l2_etype = etype;
-        target.build(&[]);
+        target.build_l2(&[]);
         target
     }
 
@@ -556,8 +612,17 @@ impl Session {
         options.push(opt);
     }
 
-    pub fn clear_tcp_option(&mut self) {
-        self.l4_tcp_options.clear();
+    pub fn current_tcp_option(&mut self, flags: u8) -> Option<&mut Vec<TcpOption>> {
+        self.l4_tcp_options.get_mut(&flags)
+    }
+
+    pub fn clear_tcp_option(&mut self, flags: Option<u8>) {
+        if let Some(flags) = flags {
+            self.l4_tcp_options.remove(&flags);
+        }
+        else {
+            self.l4_tcp_options.clear();
+        }
     }
 
     pub fn assign_dst_mac(&mut self, mac: &str) -> bool {
@@ -655,6 +720,11 @@ impl Session {
         }
     }
 
+    unsafe fn catch_l3_ip_version_prefix(&mut self) -> (u8, u8) {
+        let l3_payload = self.intl[L2_ETHERNET_SIZE..].as_mut_ptr();
+        ((*l3_payload & 0xF0 >> 4), ((*l3_payload) & 0x0F * 4))
+    }
+
     #[inline]
     fn modify_l3_ipv6_flow_label(&mut self, flow_iden: u32) {
         let start = L2_ETHERNET_SIZE;
@@ -709,12 +779,24 @@ impl Session {
     }
 
     #[inline]
-    pub unsafe fn modify_l3_ipv4_fragment(&mut self, has_multiple: bool, fragment_offset: u16) {
+    pub unsafe fn modify_l3_ipv4_fragment(&mut self, resv: bool, dont_fragment: bool, more_fragment: bool, fragment_offset: u16) {
         let ptr = self.intl[L2_ETHERNET_SIZE..].as_mut_ptr().wrapping_add(6) as *mut u16;
-        let flags: u16 = if has_multiple { 1 } else { 0 };
-
+        let a: u16 = if more_fragment { 1 } else { 0 };
+        let b: u16 = if dont_fragment { 2 } else { 0 };
+        let c: u16 = if resv { 4 } else { 0 };
+        let flags = a | b | c;
         let ff_value: u16 = ((flags << 13) | ((fragment_offset / 8) & 0x1FFF)) & 0xFFFF;
         *ptr = ff_value.to_be();
+    }
+
+    #[inline]
+    pub unsafe fn catch_l3_ipv4_fragment(&mut self) -> FragmentInfo {
+        let ptr = self.intl[L2_ETHERNET_SIZE..].as_mut_ptr().wrapping_add(6) as *mut u16;
+        let resv = *ptr & 0x0800 > 0;
+        let df = *ptr & 0x0400 > 0;
+        let mf = *ptr & 0x0200 > 0;
+        let fragment_offset = *ptr & 0x1FF;
+        (resv, df, mf, fragment_offset)
     }
 
     #[inline]
@@ -788,7 +870,7 @@ impl Session {
             self.build_l2_intl_ethertype();
             unsafe {
                 self.modify_l3_ip_version_prefix();
-                self.modify_l3_ip_dsc_ecn(0, 0);
+                self.modify_l3_ip_dsc_ecn(self.l3_dsc, self.l3_ecn);
 
                 let src_ip = self.l3_src_ip.to_owned();
                 let dst_ip = self.l3_dst_ip.to_owned();
@@ -800,7 +882,7 @@ impl Session {
                     self.modify_l3_ip_length(L3_IPV4_HEADER_SIZE.try_into().unwrap()); // Let assume initial length has 20 bytes
 
                     self.modify_l3_ipv4_idenification(self.l3_ipv4_iden);
-                    self.modify_l3_ipv4_fragment(self.l3_fragment.0, self.l3_fragment.1);
+                    self.modify_l3_ipv4_fragment(self.l3_fragment.0, self.l3_fragment.1, self.l3_fragment.2, self.l3_fragment.3);
                     self.modify_l3_ipv4_ttl(self.l3_ipv4_ttl);
                     self.modify_l3_ipv4_checksum(0);
                 } else if self.is_ether_ipv6() {
@@ -873,11 +955,23 @@ impl Session {
         *sport_ptr = sport.to_be();
     }
 
+    pub unsafe fn catch_l4_source_port(&self) -> u16 {
+        let ptr = self.l4_unsafe_ptr().as_ptr();
+        let sport_ptr = ptr as *mut u16;
+        *sport_ptr
+    }
+
     #[inline]
     pub unsafe fn modify_l4_destination_port(&mut self, dport: u16) {
         let ptr = self.l4_mut_unsafe_ptr().as_mut_ptr();
         let dport_ptr = ptr.wrapping_add(2) as *mut u16;
         *dport_ptr = dport.to_be();
+    }
+
+    pub unsafe fn catch_l4_destination_port(&self) -> u16 {
+        let ptr = self.l4_unsafe_ptr().as_ptr();
+        let dport_ptr = ptr.wrapping_add(2) as *mut u16;
+        *dport_ptr
     }
 
     #[inline]
@@ -911,6 +1005,12 @@ impl Session {
         current_length
     }
 
+    pub unsafe fn catch_l4_tcp_length(&self) -> usize {
+        let ptr = self.l4_unsafe_ptr().as_ptr();
+        let length_ptr = ptr.wrapping_add(12);
+        (((*length_ptr & 0xf0) >> 4) * 4).into()
+    }
+
     #[inline]
     pub unsafe fn modify_l4_tcp_option(&mut self, with_tcp_option: &[u8]) {
         let ptr = self.l4_mut_unsafe_ptr().as_mut_ptr();
@@ -927,6 +1027,13 @@ impl Session {
         *length_ptr = length.to_be();
     }
 
+    #[inline]
+    pub unsafe fn catch_l4_udp_length(&self) -> u16 {
+        let ptr = self.l4_unsafe_ptr().as_ptr();
+        let length_ptr = ptr.wrapping_add(4) as *mut u16;
+        *length_ptr
+    }
+
     /**
      * Caution: Accuracy ECN and Reserved bits present in bits 9-12 cannot be modified using this function.
      */
@@ -935,6 +1042,18 @@ impl Session {
         let ptr = self.l4_mut_unsafe_ptr().as_mut_ptr();
         let flags_ptr = ptr.wrapping_add(13);
         *flags_ptr = flags;
+    }
+
+    #[inline]
+    pub unsafe fn modify_l4_tcp_flags_ecn(&mut self, ecn: bool) {
+        let ptr = self.l4_mut_unsafe_ptr().as_mut_ptr();
+        let flags_ptr = ptr.wrapping_add(12);
+        if ecn {
+            *flags_ptr |= 0x10; // ECN Flags
+        }
+        else {
+            *flags_ptr |= 0xEF; // ECN Flags is disabled
+        }
     }
 
     #[inline]
@@ -983,6 +1102,9 @@ impl Session {
                     }
                     self.modify_l4_tcp_length(&tcp_options_pl);
                     self.modify_l4_tcp_flags(self.l4_tcp_flags);
+                    if self.l4_tcp_flags_ecn {
+                        self.modify_l4_tcp_flags_ecn(true);
+                    }
                     self.modify_l4_tcp_window_size(self.l4_tcp_window_size);
                     self.modify_l4_checksum(0); // initial checksum is zero.
 
@@ -1002,6 +1124,7 @@ impl Session {
                     }
 
                     if self.or_insert_payload(with_payload) {
+
                         self.build_layer = Layer::L4;
                         if self.transport_checksum {
                             let checksum = self.catch_l4_checksum(IPProtocol::TCP);
@@ -1130,27 +1253,6 @@ impl Session {
         }
     }
 
-    ///
-    /// Rebuild based on the currently built layer stage.
-    /// To rebuild all layers, use the `build` method,
-    ///
-    pub fn rebuild(&mut self, with_payload: &[u8]) {
-        match self.build_layer {
-            Layer::L1 => {
-                // Raw data ?
-                self.intl[..with_payload.len()].copy_from_slice(with_payload);
-                self.capacity = with_payload.len();
-            }
-            Layer::L2 => self.build_l2(with_payload),
-            Layer::L3 => self.build_l3(with_payload),
-            Layer::L4 => {
-                self.build_l3(&[]);
-                self.build_l4(with_payload);
-            }
-            _ => {}
-        }
-    }
-
     pub fn is_ether_ipv4(&self) -> bool {
         self.l2_etype == 0x0800
     }
@@ -1189,15 +1291,44 @@ impl Session {
 
         if rebuild {
             let payload = self.data().to_vec();
-            self.rebuild(&payload);
+            self.build(&payload);
         }
+
+        self.reverse = !self.reverse;
     }
 
     pub fn current_layer(&self) -> Layer {
         self.build_layer
     }
 
+    pub fn is_reverse(&self) -> bool {
+        self.reverse
+    }
+
     pub fn pktlen(&self) -> usize {
         self.capacity
+    }
+
+    pub fn mtu(&self) -> usize {
+        self.mtu
+    }
+
+    ///
+    /// Modify the MTU size of the packet to reconstruct it.
+    ///
+    /// Normally 1500 bytes are used, ff change it to a
+    /// different value, communication may not be smooth or
+    /// the service may not be provided.
+    ///
+    /// <b>Caution: Modifying this value will result in the loss of
+    /// the original data that was built, and you will need to
+    /// rebuild them. </b>
+    ///
+    pub fn modify_mtu(&mut self, mtu: usize) {
+        self.mtu = mtu;
+        self.intl.resize(self.mtu, 0);
+        if self.capacity > self.mtu {
+            self.capacity = self.mtu;
+        }
     }
 }

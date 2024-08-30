@@ -1,9 +1,18 @@
 use std::ops::{BitAnd, BitOr, BitXor, Not};
 
+///
+/// Represents fragment information in Ipv4:
+/// `RESV, DF, MF, Fragment Offset`
+/// 
+pub type FragmentInfo = (bool, bool, bool, u16);
+
 #[repr(u8)]
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum IPProtocol {
+    // L2 or Raw
     NONE = 0,
+
+    // L3 IP Protocol
     ICMP = 1,
     TCP = 6,
     UDP = 17,
@@ -119,6 +128,7 @@ impl TcpOption {
                     .collect()
             }
             TcpOption::WindowScale(scale) => vec![0x03, 0x03, *scale],
+            TcpOption::SACKPermitted => vec![0x04, 0x02], // SACK Permitted
             TcpOption::SelectiveAcknowledgment(blocks) => {
                 let mut bytes = vec![0x05, 0x02 + 8 * blocks.len() as u8];
                 for &(start, end) in blocks {
@@ -133,7 +143,6 @@ impl TcpOption {
                 bytes.extend_from_slice(&ts_echo.to_be_bytes());
                 bytes
             }
-            TcpOption::SACKPermitted => vec![0x04, 0x02], // SACK Permitted
             TcpOption::Unknown => vec![],
         }
     }
