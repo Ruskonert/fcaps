@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::{
-    general::{FragmentInfo, IPProtocol, Layer, TcpFlag, TcpOption}, preset::Preset, util
+    general::{FragmentInfo, IPProtocol, Layer, TcpFlag, TcpOption},
+    util,
 };
 
 pub const L2_ETHERNET_SIZE: usize = 14;
@@ -139,7 +140,7 @@ pub struct Session {
     pub l4_dport: u16,
 
     // TCP material
-    pub l4_tcp_options: HashMap<u8, Vec<TcpOption>>,
+    l4_tcp_options: HashMap<u8, Vec<TcpOption>>,
     pub l4_tcp_flags: u8,
     pub l4_tcp_flags_ecn: bool,
     pub l4_tcp_sequence: u32,
@@ -147,7 +148,10 @@ pub struct Session {
     pub l4_tcp_window_size: u16,
     pub l4_tcp_urgent_ptr: u16,
 
-    pub fp: HashMap<u8, Preset>, // flag 0 is undefined (Not TCP case)
+    pub l4_tcp_option_mss: u16,
+    pub l4_tcp_option_window_scale: u8,
+    pub l4_tcp_option_tsval: u32,
+    pub l4_tcp_option_tsecho: u32,
 
     // internal management only
     mtu: usize,
@@ -579,24 +583,46 @@ impl Session {
         return true;
     }
 
-    pub fn assign_tcp_option_with_padding(&mut self, tcp_flag: u8, opt: TcpOption) {
+    pub fn assign_tcp_option(&mut self, tcp_flag: u8, opt: TcpOption, with_pad: bool) {
         let options = self.l4_tcp_options.entry(tcp_flag).or_insert(Vec::new());
         match opt {
+            TcpOption::WindowScale(n) if n == 0 => {
+                if with_pad {
+                    options.push(TcpOption::NoOperation);
+                }
+                options.push(TcpOption::WindowScale(self.l4_tcp_option_window_scale));
+            }
             TcpOption::WindowScale(_) => {
-                options.push(TcpOption::NoOperation);
+                if with_pad {
+                    options.push(TcpOption::NoOperation);
+                }
                 options.push(opt);
             }
+            TcpOption::Timestamp(ts_val, ts_echo) if ts_val == 0 && ts_echo == 0 => {
+                if with_pad {
+                    options.push(TcpOption::NoOperation);
+                    options.push(TcpOption::NoOperation);
+                }
+                options.push(TcpOption::Timestamp(
+                    self.l4_tcp_option_tsval,
+                    self.l4_tcp_option_tsecho,
+                ));
+            }
             TcpOption::Timestamp(_, _) | TcpOption::SACKPermitted => {
-                options.push(TcpOption::NoOperation);
-                options.push(TcpOption::NoOperation);
+                if with_pad {
+                    options.push(TcpOption::NoOperation);
+                    options.push(TcpOption::NoOperation);
+                }
                 options.push(opt);
             }
             TcpOption::SelectiveAcknowledgment(_) => {
-                let vecs = opt.to_bytes();
-                let modular = vecs.len() % 4;
-                if modular > 0 {
-                    for _ in 0..(4 - modular) {
-                        options.push(TcpOption::NoOperation);
+                if with_pad {
+                    let vecs = opt.to_bytes();
+                    let modular = vecs.len() % 4;
+                    if modular > 0 {
+                        for _ in 0..(4 - modular) {
+                            options.push(TcpOption::NoOperation);
+                        }
                     }
                 }
                 options.push(opt);
@@ -607,11 +633,6 @@ impl Session {
         }
     }
 
-    pub fn assign_tcp_option(&mut self, tcp_flag: u8, opt: TcpOption) {
-        let options = self.l4_tcp_options.entry(tcp_flag).or_insert(Vec::new());
-        options.push(opt);
-    }
-
     pub fn current_tcp_option(&mut self, flags: u8) -> Option<&mut Vec<TcpOption>> {
         self.l4_tcp_options.get_mut(&flags)
     }
@@ -619,8 +640,7 @@ impl Session {
     pub fn clear_tcp_option(&mut self, flags: Option<u8>) {
         if let Some(flags) = flags {
             self.l4_tcp_options.remove(&flags);
-        }
-        else {
+        } else {
             self.l4_tcp_options.clear();
         }
     }
@@ -779,7 +799,13 @@ impl Session {
     }
 
     #[inline]
-    pub unsafe fn modify_l3_ipv4_fragment(&mut self, resv: bool, dont_fragment: bool, more_fragment: bool, fragment_offset: u16) {
+    pub unsafe fn modify_l3_ipv4_fragment(
+        &mut self,
+        resv: bool,
+        dont_fragment: bool,
+        more_fragment: bool,
+        fragment_offset: u16,
+    ) {
         let ptr = self.intl[L2_ETHERNET_SIZE..].as_mut_ptr().wrapping_add(6) as *mut u16;
         let a: u16 = if more_fragment { 1 } else { 0 };
         let b: u16 = if dont_fragment { 2 } else { 0 };
@@ -882,7 +908,12 @@ impl Session {
                     self.modify_l3_ip_length(L3_IPV4_HEADER_SIZE.try_into().unwrap()); // Let assume initial length has 20 bytes
 
                     self.modify_l3_ipv4_idenification(self.l3_ipv4_iden);
-                    self.modify_l3_ipv4_fragment(self.l3_fragment.0, self.l3_fragment.1, self.l3_fragment.2, self.l3_fragment.3);
+                    self.modify_l3_ipv4_fragment(
+                        self.l3_fragment.0,
+                        self.l3_fragment.1,
+                        self.l3_fragment.2,
+                        self.l3_fragment.3,
+                    );
                     self.modify_l3_ipv4_ttl(self.l3_ipv4_ttl);
                     self.modify_l3_ipv4_checksum(0);
                 } else if self.is_ether_ipv6() {
@@ -1050,8 +1081,7 @@ impl Session {
         let flags_ptr = ptr.wrapping_add(12);
         if ecn {
             *flags_ptr |= 0x10; // ECN Flags
-        }
-        else {
+        } else {
             *flags_ptr |= 0xEF; // ECN Flags is disabled
         }
     }
@@ -1124,7 +1154,6 @@ impl Session {
                     }
 
                     if self.or_insert_payload(with_payload) {
-
                         self.build_layer = Layer::L4;
                         if self.transport_checksum {
                             let checksum = self.catch_l4_checksum(IPProtocol::TCP);

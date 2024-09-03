@@ -1,9 +1,14 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::Mutex};
 
 use lazy_static::lazy_static;
-use rand::{rngs::ThreadRng, Rng};
+use rand::{seq::SliceRandom, Rng};
 
-use crate::{general::{FragmentInfo, IPProtocol, Layer, TcpFlag, TcpOption}, session::Session};
+use crate::{
+    general::{FragmentInfo, IPProtocol, Layer, TcpFlag, TcpOption},
+    session::Session,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PresetQuirk {
@@ -11,8 +16,8 @@ pub enum PresetQuirk {
     NonZeroIdWithDF,    // ipv4 only
     NonZeroIdWithoutDF, // ipv4 only
     UseEcn,
-    ReservedNotZero,    // ipv4 only
-    HasFlow,            // ipv6 only
+    ReservedNotZero, // ipv4 only
+    HasFlow,         // ipv6 only
     SequenceNumberZero,
     AcknowledgeNumberNonZeroWithNoFlag,
     HasUrgentFlag,
@@ -39,7 +44,6 @@ impl PresetWindowSizeOp {
             PresetWindowSizeOp::Multiple => '*',
             PresetWindowSizeOp::Div => '/',
             PresetWindowSizeOp::Modular => '%',
-            _ => panic!(),
         }
     }
 
@@ -54,7 +58,6 @@ impl PresetWindowSizeOp {
             PresetWindowSizeOp::Multiple => t1 * t2,
             PresetWindowSizeOp::Div => t1 / t2,
             PresetWindowSizeOp::Modular => t1 % t2,
-            _ => panic!("Can't calculate"),
         }
     }
 }
@@ -102,12 +105,12 @@ pub enum PresetWindowSize {
 }
 
 //
-// 
-// Interpret the signature information that p0f has and 
+//
+// Interpret the signature information that p0f has and
 // define metadata presets that can be reflected in the Session.
-// 
+//
 // The signature structure in p0f is as follows:
-// 
+//
 // sig = ver:ittl:olen:mss:wsize,scale:olayout:quirks:pclass
 //
 //   ver        - signature for IPv4 ('4'), IPv6 ('6'), or both ('*').
@@ -266,12 +269,14 @@ impl Preset {
     /// system characteristics.
     ///
     /// ```rust
-    /// use Preset;
-    /// let mut preset = Preset::new("4:64:0:*:mss*10,6:mss,sok,ts,nop,ws:df,id+:0");
+    /// use fpcaps::preset::Preset;
     ///
+    /// let mut preset = Preset::new("Linux_3_1", "4:64:0:*:mss*10,6:mss,sok,ts,nop,ws:df,id+:0");
+    /// // Todo...
     /// ```
     ///
     pub fn new(os_name: &str, sig: &str) -> Self {
+        println!("os_name: {}, sig: {}", os_name, sig);
         let mut spliter = sig.split(":");
         let ip_version = Self::dissect_ip_version(spliter.next().unwrap());
         let ttl = Self::dissect_ttl(spliter.next().unwrap());
@@ -321,10 +326,15 @@ impl Preset {
     #[inline]
     fn dissect_ttl(s: &str) -> u8 {
         match u8::from_str_radix(s, 10) {
-            Ok(n) => match n {
-                32 | 64 | 128 | 255 => n,
-                _ => panic!("Unsupported TTL value: {}, custom-ttl? (32/64/128/255)", n),
-            },
+            Ok(n) => {
+                match n {
+                    32 | 60 | 64 | 128 | 255 => n,
+                    _ => {
+                        println!("Warning: Non-standard TTL value: {}, (well-known TTL: 32/60/64/128/255)", n);
+                        n
+                    }
+                }
+            }
             Err(e) => {
                 panic!("{}", e);
             }
@@ -344,8 +354,7 @@ impl Preset {
     #[inline]
     fn dissect_mss(s: &str) -> u16 {
         match s {
-            "" |
-            "*" => 0, // it means depends on MSS in TCP Option.
+            "" | "*" => 0, // it means depends on MSS in TCP Option.
             k => match u16::from_str_radix(k, 10) {
                 Ok(mss) => mss,
                 Err(_) => {
@@ -410,8 +419,7 @@ impl Preset {
     #[inline]
     fn dissect_window_scale(s: &str) -> u8 {
         match s {
-            "" |
-            "*" => 0,
+            "" | "*" => 0,
             k => match u8::from_str_radix(k, 10) {
                 Ok(mss) => mss,
                 Err(_) => {
@@ -431,7 +439,7 @@ impl Preset {
         let mut result = vec![];
         while string != None {
             let opt = match string.unwrap().to_lowercase().as_str() {
-                "eol+n" => TcpOption::EndOfOptionList,
+                "eol+n" => TcpOption::EndOfOptionList, // @@@ TODO: eol+n dissect
                 "nop" => TcpOption::NoOperation,
                 "mss" => TcpOption::MaximumSegmentSize(0),
                 "ws" => TcpOption::WindowScale(0),
@@ -449,7 +457,8 @@ impl Preset {
 
     #[inline]
     fn dissect_tcp_quirks(s: &str) -> Vec<PresetQuirk> {
-        if s == "" {
+        // Maybe it is payload class, or empty.
+        if s == "0" || s == "" {
             return vec![];
         }
         let mut spliter = s.split(",");
@@ -473,7 +482,7 @@ impl Preset {
                 "opt+" => PresetQuirk::TcpOptionNonZero,
                 "exws" => PresetQuirk::ExcessiveWindowScaling,
                 "bad" => PresetQuirk::Malformed,
-                _ => panic!("Can't dissect quirks option!"),
+                _ => panic!("Can't dissect quirks option, name: {:?}", string),
             };
             let opt = preset_quirk;
             result.push(opt);
@@ -485,8 +494,7 @@ impl Preset {
     #[inline]
     fn dissect_payload_class(s: &str) -> u8 {
         match s {
-            "" |
-            "*" => 0,
+            "" | "*" => 0,
             k => match u8::from_str_radix(k, 10) {
                 Ok(mss) => mss,
                 Err(_) => {
@@ -515,11 +523,11 @@ impl Preset {
         //
         // IPv4 Option is not exist in fcaps default.
         // But need to modify them ..?
-        // 
+        //
         // self.ip_option_len = ??
         //
 
-        let perent_mss = if self.mss != 0 {
+        let mut perent_mss = if self.mss != 0 {
             Some(TcpOption::MaximumSegmentSize(self.mss))
         } else {
             None
@@ -537,7 +545,7 @@ impl Preset {
                         PresetWindowSize::MSS => mss = Some(element.clone()),
                         PresetWindowSize::Number(n) => {
                             if n == &0 {
-                                // disable them (equals "*") 
+                                // disable them (equals "*")
                                 break;
                             }
                             number = Some(element.clone());
@@ -550,75 +558,82 @@ impl Preset {
                 if let Some(_) = mss {
                     if perent_mss == None {
                         // mss is not defined, but need to mss ??
-                        println!("MSS is not undefined, but window size need to MSS.");
+                        println!("MSS is not undefined, but window size need to MSS, use default");
+                        perent_mss = Some(TcpOption::MaximumSegmentSize(1460));
                     }
-                    else {
-                        if number != None {
-                            sess.l4_tcp_window_size = if let Some(TcpOption::MaximumSegmentSize(n)) = perent_mss {
+
+                    if number != None {
+                        sess.l4_tcp_window_size =
+                            if let Some(TcpOption::MaximumSegmentSize(n)) = perent_mss {
                                 // window size = MSS * scale.
-                                if let Some(PresetWindowSize::Number(n2)) = number { 
+                                if let Some(PresetWindowSize::Number(n2)) = number {
                                     if let Some(ops) = ops {
                                         ops.calc(n, n2)
-                                    }
-                                    else {
+                                    } else {
                                         panic!("Can't apply them, because The ops was not existed")
                                     }
+                                } else {
+                                    unreachable!()
                                 }
-                                else { unreachable!() }
-                            } else { unreachable!() };
-                        }
+                            } else {
+                                unreachable!()
+                            };
                     }
-                }
-                else {
+                } else {
                     if number != None {
                         // Window size is fixed
-                        sess.l4_tcp_window_size = if let Some(PresetWindowSize::Number(n)) = number {
+                        sess.l4_tcp_window_size = if let Some(PresetWindowSize::Number(n)) = number
+                        {
                             n
-                        }
-                        else {
+                        } else {
                             unreachable!()
                         }
                     }
                 }
             }
-    
+
             if self.window_scale > 0 {
                 perent_scale = Some(TcpOption::WindowScale(self.window_scale));
-            }
-            else {
+            } else {
                 perent_scale = None;
             }
-    
+
             if self.tcp_option.len() > 0 {
-                // need to 
+                // need to
                 sess.clear_tcp_option(Some(flags));
-                for opt in &self.tcp_option {
+                for ref mut opt in self.tcp_option.clone() {
                     match opt {
-                        TcpOption::EndOfOptionList |
-                        TcpOption::NoOperation |
-                        TcpOption::SelectiveAcknowledgment(_) |
-                        TcpOption::Timestamp(_, _) |
-                        TcpOption::SACKPermitted => {
-                            sess.assign_tcp_option(flags, opt.clone());
+                        TcpOption::EndOfOptionList
+                        | TcpOption::NoOperation
+                        | TcpOption::SelectiveAcknowledgment(_)
+                        | TcpOption::SACKPermitted => {
+                            sess.assign_tcp_option(flags, opt.clone(), false);
+                        }
+                        TcpOption::Timestamp(_, _) => {
+                            sess.assign_tcp_option(flags, opt.clone(), false);
                         }
                         TcpOption::MaximumSegmentSize(_) => {
                             if let Some(mss) = &perent_mss {
-                                sess.assign_tcp_option(flags, mss.clone()); // use perent
-                            }
-                            else {
+                                sess.assign_tcp_option(flags, mss.clone(), false);
+                            // use perent
+                            } else {
                                 // mss is need to them, but perent MSS value is not exist
-                                println!("Warning: Signature is not given Windows Scale, but Option session is needed to it.");
-                                sess.assign_tcp_option(flags, TcpOption::WindowScale(1));
+                                println!("Warning: Signature is not given MSS, but Option session is needed to it, use default");
+                                sess.assign_tcp_option(
+                                    flags,
+                                    TcpOption::MaximumSegmentSize(1460),
+                                    false,
+                                );
                             }
                         }
                         TcpOption::WindowScale(_) => {
                             if let Some(ps) = &perent_scale {
-                                sess.assign_tcp_option(flags, ps.clone()); // use perent
-                            }
-                            else {
+                                sess.assign_tcp_option(flags, ps.clone(), false);
+                            // use perent
+                            } else {
                                 // WS is need to them, but perent WS value is not exist
-                                println!("Warning: Signature is not given Windows Scale, but Option session is needed to it.");
-                                sess.assign_tcp_option(flags, TcpOption::WindowScale(1));
+                                println!("Warning: Signature is not given Windows Scale, but Option session is needed to it, use default");
+                                sess.assign_tcp_option(flags, TcpOption::WindowScale(2), false);
                             }
                         }
                         TcpOption::Unknown => {}
@@ -690,9 +705,9 @@ impl Preset {
                         }
 
                         if sess.l4_tcp_flags & TcpFlag::Ack as u8 > 0 {
-                            sess.l4_tcp_flags &= & 0xEF;
+                            sess.l4_tcp_flags &= &0xEF;
                         }
-                    },
+                    }
                     PresetQuirk::HasUrgentFlag => {
                         if sess.l4_tcp_flags & TcpFlag::Urgent as u8 == 0 {
                             sess.l4_tcp_flags |= TcpFlag::Urgent as u8;
@@ -713,14 +728,16 @@ impl Preset {
                         }
                     }
                     PresetQuirk::Malformed => {
-                        println!("Warning: Current TCP option will be cleared due to quirk! name:bad"); 
+                        println!(
+                            "Warning: Current TCP option will be cleared due to quirk! name:bad"
+                        );
                         sess.clear_tcp_option(Some(flags));
 
                         /* Anomaly TCP option! */
-                        sess.assign_tcp_option(flags, TcpOption::WindowScale(0));
-                        sess.assign_tcp_option(flags, TcpOption::WindowScale(0));
-                        sess.assign_tcp_option(flags, TcpOption::WindowScale(0));
-                        sess.assign_tcp_option(flags, TcpOption::WindowScale(0));
+                        sess.assign_tcp_option(flags, TcpOption::WindowScale(0), false);
+                        sess.assign_tcp_option(flags, TcpOption::WindowScale(0), false);
+                        sess.assign_tcp_option(flags, TcpOption::WindowScale(0), false);
+                        sess.assign_tcp_option(flags, TcpOption::WindowScale(0), false);
                     }
                     PresetQuirk::ExcessiveWindowScaling => {
                         let mut found = false;
@@ -738,7 +755,7 @@ impl Preset {
                             }
                         }
                         if !found {
-                            sess.assign_tcp_option_with_padding(flags, TcpOption::WindowScale(15));
+                            sess.assign_tcp_option(flags, TcpOption::WindowScale(15), false);
                         }
                     }
                     // PresetQuirk::SynTimeStampZero => {
@@ -747,7 +764,7 @@ impl Preset {
 
                     //     }
                     //     else {
-                    //         println!("Warning: Some Quirk element is not relected because this case is not Initial SYN, name:ts1-"); 
+                    //         println!("Warning: Some Quirk element is not relected because this case is not Initial SYN, name:ts1-");
                     //     }
                     // }
                     // PresetQuirk::SynTimeStampNonZero => todo!(),
@@ -764,24 +781,395 @@ impl Preset {
 }
 
 lazy_static! {
-    pub static ref PRESET : Mutex<HashMap<String, Preset>> = {
+    pub static ref SYN_ACK_OS_PRESET_STR: Mutex<HashMap<String, Vec<String>>> = {
         let mut presets = HashMap::new();
-        presets.insert("Linux_3_11".to_string(), Preset::new("Linux_3_11", "*:64:0:*:mss*20,10:mss,sok,ts,nop,ws:df,id+:0"));
-        presets.insert("Linux_3_X".to_string(), Preset::new("Linux_3_X", "*:64:0:*:mss*10,4:mss,sok,ts,nop,ws:df,id+:0"));
-        presets.insert("MAC_OS_X".to_string(), Preset::new("MAC_OS_X", "*:64:0:*:65535,*:mss,nop,ws,nop,nop,ts,sok,eol+1:df,id+:0"));
-        presets.insert("FreeBSD_9".to_string(), Preset::new("FreeBSD_9", "*:64:0:*:65535,6:mss,nop,ws,sok,ts:df,id+:0"));
-        presets.insert("Solaris_8".to_string(), Preset::new("Solaris_8", "*:64:0:*:32850,1:nop,ws,nop,nop,ts,nop,nop,sok,mss:df,id+:0"));
-        presets.insert("OpenVMS".to_string(), Preset::new("OpenVMS", "4:128:0:1460:mtu*2,0:mss,nop,ws::0"));
-        presets.insert("NeXTSTEP".to_string(), Preset::new("NeXTSTEP", "4:64:0:1024:mss*4,0:mss::0"));
+
+        // Linux 3.x
+        let vecs = vec![
+            "*:64:0:*:mss*10,0:mss:df:0".to_string(),
+            "*:64:0:*:mss*10,0:mss,sok,ts:df:0".to_string(),
+            "*:64:0:*:mss*10,0:mss,nop,nop,ts:df:0".to_string(),
+            "*:64:0:*:mss*10,0:mss,nop,nop,sok:df:0".to_string(),
+            "*:64:0:*:mss*10,*:mss,nop,ws:df:0".to_string(),
+            "*:64:0:*:mss*10,*:mss,sok,ts,nop,ws:df:0".to_string(),
+            "*:64:0:*:mss*10,*:mss,nop,nop,ts,nop,ws:df:0".to_string(),
+            "*:64:0:*:mss*10,*:mss,nop,nop,sok,nop,ws:df:0".to_string(),
+        ];
+        presets.insert("Linux_3_X".to_string(), vecs);
+
+        // Linux 2.4-2.6
+        let vecs = vec![
+            "*:64:0:*:mss*4,0:mss:df:0".to_string(),
+            "*:64:0:*:mss*4,0:mss,sok,ts:df:0".to_string(),
+            "*:64:0:*:mss*4,0:mss,nop,nop,ts:df:0".to_string(),
+            "*:64:0:*:mss*4,0:mss,nop,nop,sok:df:0".to_string(),
+        ];
+        presets.insert("Linux_2_4_2_6".to_string(), vecs);
+
+        // Linux 2.4.x
+        let vecs = vec![
+            "*:64:0:*:mss*4,0:mss,nop,ws:df:0".to_string(),
+            "*:64:0:*:mss*4,0:mss,sok,ts,nop,ws:df:0".to_string(),
+            "*:64:0:*:mss*4,0:mss,nop,nop,ts,nop,ws:df:0".to_string(),
+            "*:64:0:*:mss*4,0:mss,nop,nop,sok,nop,ws:df:0".to_string(),
+        ];
+        presets.insert("Linux_2_4_X".to_string(), vecs);
+
+        // Linux 2.6.x
+        let vecs = vec![
+            "*:64:0:*:mss*4,*:mss,nop,ws:df:0".to_string(),
+            "*:64:0:*:mss*4,*:mss,sok,ts,nop,ws:df:0".to_string(),
+            "*:64:0:*:mss*4,*:mss,nop,nop,ts,nop,ws:df:0".to_string(),
+            "*:64:0:*:mss*4,*:mss,nop,nop,sok,nop,ws:df:0".to_string(),
+        ];
+        presets.insert("Linux_2_6_X".to_string(), vecs);
+
+        // Windows XP
+        let vecs = vec![
+            "*:128:0:*:65535,0:mss:df,id+:0".to_string(),
+            "*:128:0:*:65535,0:mss,nop,ws:df,id+:0".to_string(),
+            "*:128:0:*:65535,0:mss,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:65535,0:mss,nop,nop,ts:df,id+,ts1-:0".to_string(),
+            "*:128:0:*:65535,0:mss,nop,ws,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:65535,0:mss,nop,ws,nop,nop,ts:df,id+,ts1-:0".to_string(),
+            "*:128:0:*:65535,0:mss,nop,nop,ts,nop,nop,sok:df,id+,ts1-:0".to_string(),
+            "*:128:0:*:65535,0:mss,nop,ws,nop,nop,ts,nop,nop,sok:df,id+,ts1-:0".to_string(),
+            "*:128:0:*:16384,0:mss:df,id+:0".to_string(),
+            "*:128:0:*:16384,0:mss,nop,ws:df,id+:0".to_string(),
+            "*:128:0:*:16384,0:mss,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:16384,0:mss,nop,nop,ts:df,id+,ts1-:0".to_string(),
+            "*:128:0:*:16384,0:mss,nop,ws,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:16384,0:mss,nop,ws,nop,nop,ts:df,id+,ts1-:0".to_string(),
+            "*:128:0:*:16384,0:mss,nop,nop,ts,nop,nop,sok:df,id+,ts1-:0".to_string(),
+            "*:128:0:*:16384,0:mss,nop,ws,nop,nop,ts,nop,nop,sok:df,id+,ts1-:0".to_string(),
+        ];
+        presets.insert("Windows_XP".to_string(), vecs);
+
+        // Windows 7 or 8
+        let vecs = vec![
+            "*:128:0:*:8192,0:mss:df,id+:0".to_string(),
+            "*:128:0:*:8192,0:mss,sok,ts:df,id+:0".to_string(),
+            "*:128:0:*:8192,8:mss,nop,ws:df,id+:0".to_string(),
+            "*:128:0:*:8192,0:mss,nop,nop,ts:df,id+:0".to_string(),
+            "*:128:0:*:8192,0:mss,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:8192,8:mss,nop,ws,sok,ts:df,id+:0".to_string(),
+            "*:128:0:*:8192,8:mss,nop,ws,nop,nop,ts:df,id+:0".to_string(),
+            "*:128:0:*:8192,8:mss,nop,ws,nop,nop,sok:df,id+:0".to_string(),
+        ];
+        presets.insert("Windows_7_8".to_string(), vecs);
+
+        // FreeBSD 9.x
+        let vecs = vec![
+            "*:64:0:*:65535,6:mss,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:65535,6:mss,nop,ws,sok,ts:df,id+:0".to_string(),
+            "*:64:0:*:65535,6:mss,nop,ws,nop,nop,ts:df,id+:0".to_string(),
+        ];
+        presets.insert("FreeBSD_9_X".to_string(), vecs);
+
+        // FreeBSD 8.x
+        let vecs = vec![
+            "*:64:0:*:65535,3:mss,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:65535,3:mss,nop,ws,sok,ts:df,id+:0".to_string(),
+            "*:64:0:*:65535,3:mss,nop,ws,nop,nop,ts:df,id+:0".to_string(),
+        ];
+        presets.insert("FreeBSD_8_X".to_string(), vecs);
+
+        // FreeBSD 8.x-9.x
+        let vecs = vec![
+            "*:64:0:*:65535,0:mss,sok,ts:df,id+:0".to_string(),
+            "*:64:0:*:65535,0:mss,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:65535,0:mss,nop,nop,ts:df,id+:0".to_string(),
+            "*:64:0:*:65535,0:mss,nop,nop,sok:df,id+:0".to_string(),
+        ];
+        presets.insert("FreeBSD_8_9_X".to_string(), vecs);
+
+        // MacOS X
+        let vecs = vec![
+            "*:64:0:*:65535,10:mss,sok,ts:df,id+:0".to_string(),
+            "*:64:0:*:65535,10:mss,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:65535,10:mss,nop,nop,ts:df,id+:0".to_string(),
+            "*:64:0:*:65535,10:mss,nop,nop,sok:df,id+:0".to_string(),
+        ];
+        presets.insert("MacOS_X".to_string(), vecs);
+
+        // MacOS X (Lion)
+        let vecs = vec![
+            "*:64:0:*:65535,12:mss,sok,ts:df,id+:0".to_string(),
+            "*:64:0:*:65535,12:mss,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:65535,12:mss,nop,nop,ts:df,id+:0".to_string(),
+            "*:64:0:*:65535,12:mss,nop,nop,sok:df,id+:0".to_string(),
+        ];
+        presets.insert("MacOS_X_Lion".to_string(), vecs);
+
+        // AIX 7.x
+        let vecs = vec![
+            "*:60:0:*:65535,0:mss:df,id+:0".to_string(),
+            "*:60:0:*:65535,0:mss,nop,ws:df,id+:0".to_string(),
+            "*:60:0:*:65535,0:mss,nop,nop,ts:df,id+:0".to_string(),
+            "*:60:0:*:65535,0:mss,nop,nop,sok:df,id+:0".to_string(),
+        ];
+        presets.insert("AIX_7_X".to_string(), vecs);
+
+        // AIX 5.x or 6.x
+        let vecs = vec![
+            "*:60:0:*:65535,0:mss:df,id+:0".to_string(),
+            "*:60:0:*:65535,0:mss,nop,ws:df,id+:0".to_string(),
+            "*:60:0:*:65535,0:mss,nop,nop,ts:df,id+:0".to_string(),
+            "*:60:0:*:65535,0:mss,nop,nop,sok:df,id+:0".to_string(),
+        ];
+        presets.insert("AIX_5_6_X".to_string(), vecs);
+
+        // Solaris 10
+        let vecs = vec![
+            "*:64:0:*:mss*4,0:mss,nop,ws:df:0".to_string(),
+            "*:64:0:*:mss*4,0:mss,nop,nop,ts:df:0".to_string(),
+            "*:64:0:*:mss*4,0:mss,nop,nop,sok:df:0".to_string(),
+            "*:64:0:*:mss*4,0:mss,nop,nop,sok,ts:df:0".to_string(),
+        ];
+        presets.insert("Solaris_10".to_string(), vecs);
+
+        // HPUX 11.x
+        let vecs = vec![
+            "*:64:0:*:mss*2,0:mss,nop,ws:0".to_string(),
+            "*:64:0:*:mss*2,0:mss,nop,nop,ts:0".to_string(),
+            "*:64:0:*:mss*2,0:mss,nop,nop,sok:0".to_string(),
+            "*:64:0:*:mss*2,0:mss,nop,nop,sok,ts:0".to_string(),
+        ];
+        presets.insert("HPUX_11_X".to_string(), vecs);
+
+        // Windows 2000
+        let vecs = vec![
+            "*:128:0:*:8192,0:mss,nop,ws:df,id+:0".to_string(),
+            "*:128:0:*:8192,0:mss,nop,nop,ts:df,id+:0".to_string(),
+            "*:128:0:*:8192,0:mss,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:8192,0:mss,nop,nop,sok,ts:df,id+:0".to_string(),
+        ];
+        presets.insert("Windows_2000".to_string(), vecs);
+
+        // Windows NT
+        let vecs = vec![
+            "*:128:0:*:8192,0:mss:df,id+:0".to_string(),
+            "*:128:0:*:8192,0:mss,nop,ws:df,id+:0".to_string(),
+            "*:128:0:*:8192,0:mss,nop,nop,ts:df,id+:0".to_string(),
+            "*:128:0:*:8192,0:mss,nop,nop,sok:df,id+:0".to_string(),
+        ];
+        presets.insert("Windows_NT".to_string(), vecs);
+
         Mutex::new(presets)
     };
+
+    pub static ref SYN_OS_PRESET_STR: Mutex<HashMap<String, Vec<String>>> = {
+        let mut presets = HashMap::new();
+
+        // Linux 3.11 and newer
+        let vecs = vec![
+            "*:64:0:*:mss*20,10:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:mss*20,7:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+        ];
+        presets.insert("Linux_3_11_and_newer".to_string(), vecs);
+
+        // Linux 3.1-3.10
+        let vecs = vec![
+            "*:64:0:*:mss*10,4:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:mss*10,5:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:mss*10,6:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:mss*10,7:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+        ];
+        presets.insert("Linux_3_1_to_3_10".to_string(), vecs);
+
+        // Linux 2.6.x
+        let vecs = vec![
+            "*:64:0:*:mss*4,6:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:mss*4,7:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:mss*4,8:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+        ];
+        presets.insert("Linux_2_6_x".to_string(), vecs);
+
+        // Linux 2.4.x
+        let vecs = vec![
+            "*:64:0:*:mss*4,0:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:mss*4,1:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:mss*4,2:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+        ];
+        presets.insert("Linux_2_4_x".to_string(), vecs);
+
+        // Linux 2.2.x
+        let vecs = vec![
+            "*:64:0:*:mss*11,0:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:mss*20,0:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:mss*22,0:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+        ];
+        presets.insert("Linux_2_2_x".to_string(), vecs);
+
+        // Linux 2.0
+        let vecs = vec![
+            "*:64:0:*:mss*12,0:mss::0".to_string(),
+            "*:64:0:*:16384,0:mss::0".to_string(),
+        ];
+        presets.insert("Linux_2_0".to_string(), vecs);
+
+        // Linux 3.x (loopback)
+        let vecs = vec![
+            "*:64:0:16396:mss*2,4:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:16376:mss*2,4:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+        ];
+        presets.insert("Linux_3_x_loopback".to_string(), vecs);
+
+        // Linux 2.6.x (loopback)
+        let vecs = vec![
+            "*:64:0:16396:mss*2,2:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:16376:mss*2,2:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+        ];
+        presets.insert("Linux_2_6_x_loopback".to_string(), vecs);
+
+        // Linux 2.4.x (loopback)
+        let vecs = vec![
+            "*:64:0:16396:mss*2,0:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+        ];
+        presets.insert("Linux_2_4_x_loopback".to_string(), vecs);
+
+        // Linux 2.2.x (loopback)
+        let vecs = vec![
+            "*:64:0:3884:mss*8,0:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+        ];
+        presets.insert("Linux_2_2_x_loopback".to_string(), vecs);
+
+        // Linux 2.6.x (Google crawler)
+        let vecs = vec![
+            "4:64:0:1430:mss*4,6:mss,sok,ts,nop,ws::0".to_string(),
+        ];
+        presets.insert("Linux_2_6_x_Google_crawler".to_string(), vecs);
+
+        // Linux (Android)
+        let vecs = vec![
+            "*:64:0:*:mss*44,1:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:*:mss*44,3:mss,sok,ts,nop,ws:df,id+:0".to_string(),
+        ];
+        presets.insert("Linux_Android".to_string(), vecs);
+
+        // Windows XP
+        let vecs = vec![
+            "*:128:0:*:16384,0:mss,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:65535,0:mss,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:65535,0:mss,nop,ws,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:65535,1:mss,nop,ws,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:65535,2:mss,nop,ws,nop,nop,sok:df,id+:0".to_string(),
+        ];
+        presets.insert("Windows_XP".to_string(), vecs);
+
+        // Windows 7 or 8
+        let vecs = vec![
+            "*:128:0:*:8192,0:mss,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:8192,2:mss,nop,ws,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:8192,8:mss,nop,ws,nop,nop,sok:df,id+:0".to_string(),
+            "*:128:0:*:8192,2:mss,nop,ws,sok,ts:df,id+:0".to_string(),
+        ];
+        presets.insert("Windows_7_or_8".to_string(), vecs);
+
+        // Windows 7 (Websense crawler)
+        let vecs = vec![
+            "*:64:0:1380:mss*4,6:mss,nop,nop,ts,nop,ws:df,id+:0".to_string(),
+            "*:64:0:1380:mss*4,7:mss,nop,nop,ts,nop,ws:df,id+:0".to_string(),
+        ];
+        presets.insert("Windows_7_Websense_crawler".to_string(), vecs);
+
+        // FreeBSD 9.x or newer
+        let vecs = vec![
+                    "*:64:0:*:65535,6:mss,nop,ws,sok,ts:df,id+:0".to_string(),    ];
+        presets.insert("FreeBSD_9_x_or_newer".to_string(), vecs);
+
+        // FreeBSD 8.x
+        let vecs = vec![        "*:64:0:*:65535,3:mss,nop,ws,sok,ts:df,id+:0".to_string(),    ];
+        presets.insert("FreeBSD_8_x".to_string(), vecs);
+
+        // OpenBSD 3.x
+        let vecs = vec![        "*:64:0:*:16384,0:mss,nop,nop,sok,nop,ws,nop,nop,ts:df,id+:0".to_string(),    ];
+        presets.insert("OpenBSD_3_x".to_string(), vecs);
+
+        // OpenBSD 4.x-5.x
+        let vecs = vec![        "*:64:0:*:16384,3:mss,nop,nop,sok,nop,ws,nop,nop,ts:df,id+:0".to_string(),    ];
+        presets.insert("OpenBSD_4_x_to_5_x".to_string(), vecs);
+
+        // Solaris 8
+        let vecs = vec![        "*:64:0:*:32850,1:nop,ws,nop,nop,ts,nop,nop,sok,mss:df,id+:0".to_string(),    ];
+        presets.insert("Solaris_8".to_string(), vecs);
+
+        // Solaris 10
+        let vecs = vec![        "*:64:0:*:mss*34,0:mss,nop,ws,nop,nop,sok:df,id+:0".to_string(),    ];
+        presets.insert("Solaris_10".to_string(), vecs);
+
+        // OpenVMS 8.x
+        let vecs = vec![        "4:128:0:1460:mtu*2,0:mss,nop,ws::0".to_string(),    ];
+        presets.insert("OpenVMS_8_x".to_string(), vecs);
+
+        // OpenVMS 7.x
+        let vecs = vec![        "4:64:0:1460:61440,0:mss,nop,ws::0".to_string(),    ];
+        presets.insert("OpenVMS_7_x".to_string(), vecs);
+
+        // NeXTSTEP
+        let vecs = vec![        "4:64:0:1024:mss*4,0:mss::0".to_string(),    ];
+        presets.insert("NeXTSTEP".to_string(), vecs);
+
+        // Tru64 4.x
+        let vecs = vec![        "4:64:0:1460:32768,0:mss,nop,ws:df,id+:0".to_string(),    ];
+        presets.insert("Tru64_4_x".to_string(), vecs);
+
+        Mutex::new(presets)
+    };
+
+    pub static ref SYN_ACK_OS_PRESET: Mutex<HashMap<String, Vec<Preset>>> = {
+        let mut presets = HashMap::new();
+        if let Ok(presets_str) = SYN_ACK_OS_PRESET_STR.lock() {
+            for (os_name, v) in presets_str.iter() {
+                let mut vecs = vec![];
+                for v2 in v {
+                    vecs.push(Preset::new(os_name, v2));
+                }
+                presets.insert(os_name.to_string(), vecs);
+            }
+        }
+        Mutex::new(presets)
+    };
+
+
+    pub static ref SYN_OS_PRESET: Mutex<HashMap<String, Vec<Preset>>> = {
+        let mut presets = HashMap::new();
+        if let Ok(presets_str) = SYN_OS_PRESET_STR.lock() {
+            for (os_name, v) in presets_str.iter() {
+                let mut vecs = vec![];
+                for v2 in v {
+                    vecs.push(Preset::new(os_name, v2));
+                }
+                presets.insert(os_name.to_string(), vecs);
+            }
+        }
+        Mutex::new(presets)
+    };
+
 }
 
-pub fn catch_fp_preset(os_name: &str) -> Option<Preset> {
-    if let Ok(presets) = PRESET.lock() {
-        presets.get(os_name).cloned()
+pub fn catch_syn_fp_preset(os_name: &str) -> Option<Preset> {
+    if let Ok(presets) = SYN_OS_PRESET.lock() {
+        if let Some(v) = presets.get(os_name) {
+            let mut rng = rand::thread_rng();
+            Some(v.choose(&mut rng).unwrap().clone())
+        } else {
+            None
+        }
+    } else {
+        None
     }
-    else {
+}
+
+pub fn catch_syn_ack_fp_preset(os_name: &str) -> Option<Preset> {
+    if let Ok(presets) = SYN_ACK_OS_PRESET.lock() {
+        if let Some(v) = presets.get(os_name) {
+            let mut rng = rand::thread_rng();
+            Some(v.choose(&mut rng).unwrap().clone())
+        } else {
+            None
+        }
+    } else {
         None
     }
 }
@@ -859,7 +1247,7 @@ mod test {
         vecs.push("*:128:0:*:8192,*:mss,nop,ws,nop,nop,sok:df");
         vecs.push("*:128:0:*:*,*:mss,nop,nop,sok:df");
         vecs.push("*:128:0:*:*,*:mss,nop,ws,nop,nop,sok:df");
-        
+
         for (idx, v) in vecs.iter().enumerate() {
             println!("start at {} for Windows Signature, sig={}", idx, v);
             let result = Preset::new("Some Windows", v);

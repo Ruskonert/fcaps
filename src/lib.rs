@@ -44,12 +44,13 @@ mod test {
     fn assert_write_pcap2() {
         let mut tracer = Tracer::new_with_l4(IPProtocol::TCP, 59230, 502);
         let session = tracer.as_session();
-        session.assign_tcp_option_with_padding(
+        session.assign_tcp_option(
             TcpFlag::Syn.into(),
             TcpOption::MaximumSegmentSize(1460),
+            true,
         );
-        session.assign_tcp_option_with_padding(TcpFlag::Syn.into(), TcpOption::WindowScale(8));
-        session.assign_tcp_option_with_padding(TcpFlag::Syn.into(), TcpOption::SACKPermitted);
+        session.assign_tcp_option(TcpFlag::Syn.into(), TcpOption::WindowScale(8), true);
+        session.assign_tcp_option(TcpFlag::Syn.into(), TcpOption::SACKPermitted, true);
 
         tracer.set_mode_record_packet(true);
 

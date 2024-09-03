@@ -3,7 +3,7 @@ use std::ops::{BitAnd, BitOr, BitXor, Not};
 ///
 /// Represents fragment information in Ipv4:
 /// `RESV, DF, MF, Fragment Offset`
-/// 
+///
 pub type FragmentInfo = (bool, bool, bool, u16);
 
 #[repr(u8)]

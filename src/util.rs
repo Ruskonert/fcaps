@@ -1,6 +1,8 @@
+use libc::{c_int, sysctl, sysinfo, timeval, CTL_KERN};
 use std::fs::File;
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::mem::{self, MaybeUninit};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn calc_fcs(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFFFFFF;
@@ -75,4 +77,15 @@ pub fn write_pcap(payloads: Vec<Vec<u8>>, filename: &str) -> std::io::Result<()>
     }
 
     Ok(())
+}
+
+pub fn get_linux_uptime() -> Result<u64, String> {
+    let mut info = MaybeUninit::<sysinfo>::uninit();
+    let result = unsafe { libc::sysinfo(info.as_mut_ptr()) };
+    if result == 0 {
+        let info = unsafe { info.assume_init() };
+        Ok(info.uptime as u64)
+    } else {
+        Err("Failed to get sysinfo".to_string())
+    }
 }

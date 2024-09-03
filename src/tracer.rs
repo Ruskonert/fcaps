@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+
 use rand::{thread_rng, Rng};
 
 use crate::{
     general::{IPProtocol, Layer, TcpFlag},
+    preset::Preset,
     session::Session,
-    util,
+    util::{self, get_linux_uptime},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
@@ -24,31 +27,20 @@ pub struct Tracer {
     padding: (bool, usize),
     fcs: bool,
 
+    os: HashMap<u8, Preset>,
+
     proto: IPProtocol,
 
     l4_owner_sequence_nonce: u32, // a.k.a., it equals a client sequence for TCP
     l4_peer_sequence_nonce: u32,  // a.k.a., it equals a server sequence for TCP
+
+    ts_val: u32,
+    ts_echo: u32,
 }
 
 impl Tracer {
-    pub fn new_with_session(sess: Session) -> Self {
-        let proto = sess.protocol;
-        Self {
-            inner: sess,
-            payloads: Vec::new(),
-            sequence_enabled: true,
-            connected: false,
-            fragmented: true,
-            proto,
-            padding: (true, 60),
-            fcs: false,
-            record: true,
-            ..Default::default()
-        }
-    }
-
-    pub fn new_with_l2(etype: u16) -> Self {
-        let sess = Session::create_ether(etype);
+    fn new_with_default() -> Self {
+        let sess = Session::create_ether(0x0800);
         Self {
             inner: sess,
             payloads: Vec::new(),
@@ -59,8 +51,25 @@ impl Tracer {
             padding: (true, 60),
             fcs: false,
             record: true,
+            ts_val: get_linux_uptime().unwrap() as u32,
+            ts_echo: 0,
             ..Default::default()
         }
+    }
+
+    pub fn new_with_session(sess: Session) -> Self {
+        let proto = sess.protocol;
+        let mut tracer = Self::new_with_default();
+        tracer.inner = sess;
+        tracer.proto = proto;
+        tracer
+    }
+
+    pub fn new_with_l2(etype: u16) -> Self {
+        let sess = Session::create_ether(etype);
+        let mut tracer = Self::new_with_default();
+        tracer.inner = sess;
+        tracer
     }
 
     pub fn new_with_l4(proto: IPProtocol, owner_port: u16, peer_port: u16) -> Self {
@@ -92,6 +101,14 @@ impl Tracer {
         } else {
             TracerDirection::Forward
         }
+    }
+
+    pub fn regi_os(&mut self, flags: u8, value: &Preset) {
+        self.os.insert(flags, value.clone());
+    }
+
+    pub fn unregi_os(&mut self, flags: u8) -> Option<Preset> {
+        self.os.remove(&flags)
     }
 
     pub fn into_session(&mut self, sess: Session) {
@@ -179,7 +196,17 @@ impl Tracer {
     /// Switch the current owner and peer, and reassemble the packet again.
     ///
     pub fn switch_direction(&mut self, rebuild: bool) {
+        std::mem::swap(&mut self.ts_val, &mut self.ts_echo);
         self.inner.reverse_session(rebuild); // Swapping direction
+    }
+
+    pub fn update_timestamp(&mut self) {
+        self.ts_val = get_linux_uptime().unwrap() as u32;
+    }
+
+    pub fn initialize_timestamp(&mut self) {
+        self.ts_val = get_linux_uptime().unwrap() as u32;
+        self.ts_echo = 0;
     }
 
     ///
@@ -192,8 +219,10 @@ impl Tracer {
                 // NEED TO RESET?
                 self.switch_direction(false);
                 self.sendp_tcp_finish();
+
                 self.switch_direction(false);
                 self.sendp_tcp_finish();
+
                 match self.direction() {
                     // prevent re-used port
                     TracerDirection::Forward => self.inner.l4_sport += 1,
@@ -214,11 +243,14 @@ impl Tracer {
             self.set_mode_fix_l4_tcp_sequence(false);
             self.inner.l4_tcp_sequence = self.l4_owner_sequence_nonce;
             self.inner.l4_tcp_acknowledgment = 0; // init value is zero
+
+            self.initialize_timestamp();
+
             let p1 = self.build_tcp_packet(TcpFlag::Syn.into(), &[]);
             self.switch_direction(false);
             self.set_mode_fix_l4_tcp_sequence(true);
-
             self.l4_owner_sequence_nonce += 1;
+
             let p2 = self.build_tcp_packet(TcpFlag::Syn | TcpFlag::Ack, &[]);
 
             self.l4_peer_sequence_nonce += 1;
@@ -226,6 +258,7 @@ impl Tracer {
 
             self.inner.l4_tcp_sequence = self.l4_peer_sequence_nonce;
             self.inner.l4_tcp_acknowledgment = self.l4_owner_sequence_nonce;
+
             let p3 = self.build_tcp_packet(TcpFlag::Ack.into(), &[]);
 
             self.connected = true;
@@ -302,7 +335,6 @@ impl Tracer {
                             self.inner.modify_l4_udp_length((payload_len + 8) as u16);
                             // included UDP header length
                         }
-
                         self.inner.build(&with_payload[..max_payload_len - 8]);
 
                         self.inner.set_mode_automatic_length(true);
@@ -436,6 +468,17 @@ impl Tracer {
     }
 
     fn build_tcp_packet(&mut self, flags: u8, with_payload: &[u8]) -> Vec<u8> {
+        self.update_timestamp();
+
+        self.inner.l4_tcp_flags = flags;
+        self.inner.l4_tcp_option_tsval = self.ts_val;
+        self.inner.l4_tcp_option_tsecho = self.ts_echo;
+
+        if let Some(os) = self.os.get(&self.inner.l4_tcp_flags) {
+            self.inner.clear_tcp_option(Some(flags));
+            os.reflect_to_session(self.inner.l4_tcp_flags, &mut self.inner);
+        }
+
         if self.sequence_enabled {
             if self.inner.is_reverse() {
                 self.inner.l4_tcp_sequence = self.l4_peer_sequence_nonce;
@@ -445,7 +488,6 @@ impl Tracer {
                 self.inner.l4_tcp_acknowledgment = self.l4_peer_sequence_nonce;
             }
         }
-        self.inner.l4_tcp_flags = flags;
         let result = self.build_and_packet(with_payload);
         result
     }
