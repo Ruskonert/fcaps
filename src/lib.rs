@@ -9,10 +9,7 @@ mod test {
     use std::time::{Duration, Instant};
 
     use crate::{
-        general::{IPProtocol, Layer, TcpFlag, TcpOption},
-        session::Session,
-        tracer::Tracer,
-        util::write_pcap,
+        general::{IPProtocol, Layer, TcpFlag, TcpOption}, preset::catch_syn_fp_preset, session::Session, tracer::Tracer, util::write_pcap
     };
 
     #[test]
@@ -94,6 +91,8 @@ mod test {
             vecs.push(k as u8);
         }
 
+        tracer.set_mode_record_packet(true);
+
         tracer.send(&[0x41, 0x41, 0x41], false);
         tracer.send(&vecs, true);
         tracer.switch_direction(false);
@@ -107,18 +106,22 @@ mod test {
     #[test]
     fn assert_tcp_segment_pcap() {
         let mut tracer = Tracer::new_with_l4(IPProtocol::TCP, 59231, 1234);
-        let mut vecs: Vec<u8> = Vec::with_capacity(8880);
-        for i in 0..8880 {
+        tracer.regi_os(TcpFlag::Syn as u8, &catch_syn_fp_preset("Linux_3_1_to_3_10").unwrap());
+        tracer.set_mode_record_packet(true);
+        let mut vecs: Vec<u8> = Vec::with_capacity(16660);
+        for i in 0..16660 {
             let k = i % (0x0a as u16);
             vecs.push(k as u8);
         }
-
+        tracer.sendp_handshake();
         tracer.send(&[0x41, 0x41, 0x41], false);
         tracer.send(&vecs, true);
         tracer.switch_direction(false);
 
         tracer.send(&[0x41, 0x41, 0x41], false);
         tracer.send(&vecs, true);
+
+        tracer.sendp_tcp_reset();
 
         println!("{:?}", write_pcap(tracer.payloads, "./new_4.pcap"));
     }

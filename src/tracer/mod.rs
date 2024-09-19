@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use rand::{thread_rng, Rng};
 
@@ -6,7 +9,7 @@ use crate::{
     general::{IPProtocol, Layer, TcpFlag},
     preset::Preset,
     session::Session,
-    util::{self, get_linux_uptime},
+    util::{self},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
@@ -36,9 +39,29 @@ pub struct Tracer {
 
     ts_val: u32,
     ts_echo: u32,
+
+    ts_started: u128,
+}
+
+pub trait PacketSend {
+    fn sendp(&mut self, app_data: &[u8]) -> Vec<Vec<u8>>;
+}
+
+impl PacketSend for Tracer {
+    fn sendp(&mut self, app_data: &[u8]) -> Vec<Vec<u8>> {
+        self.send(app_data, false)
+    }
 }
 
 impl Tracer {
+    #[inline]
+    pub fn uptime() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
     fn new_with_default() -> Self {
         let sess = Session::create_ether(0x0800);
         Self {
@@ -50,11 +73,16 @@ impl Tracer {
             proto: IPProtocol::NONE,
             padding: (true, 60),
             fcs: false,
-            record: true,
-            ts_val: get_linux_uptime().unwrap() as u32,
+            record: false,
+            ts_val: 0,
             ts_echo: 0,
+            ts_started: Self::uptime(),
             ..Default::default()
         }
+    }
+
+    pub fn protocol(&mut self) -> IPProtocol {
+        self.proto
     }
 
     pub fn new_with_session(sess: Session) -> Self {
@@ -90,7 +118,7 @@ impl Tracer {
             proto,
             padding: (true, 60),
             fcs: false,
-            record: true,
+            record: false,
             ..Default::default()
         }
     }
@@ -186,6 +214,10 @@ impl Tracer {
         &mut self.inner
     }
 
+    pub fn as_session_ref(&self) -> &Session {
+        &self.inner
+    }
+
     pub fn initialize_seq_ack(&mut self) {
         let mut thread_rng = rand::thread_rng();
         self.l4_owner_sequence_nonce = thread_rng.gen_range(1..=std::u32::MAX);
@@ -201,12 +233,28 @@ impl Tracer {
     }
 
     pub fn update_timestamp(&mut self) {
-        self.ts_val = get_linux_uptime().unwrap() as u32;
+        self.ts_val = ((Self::uptime() - self.ts_started)) as u32;
     }
 
     pub fn initialize_timestamp(&mut self) {
-        self.ts_val = get_linux_uptime().unwrap() as u32;
+        self.ts_val = 0;
         self.ts_echo = 0;
+    }
+
+    fn reset_tcp_info(&mut self) {
+        self.connected = false;
+        match self.direction() {
+            // prevent re-used port
+            TracerDirection::Forward => self.inner.l4_sport += 1,
+            TracerDirection::Backward => {
+                let mut port = self.inner.l4_dport as u32 + 1;
+                if port > 65535 {
+                    port = 1025;
+                }
+                self.inner.l4_dport = port as u16;
+                self.switch_direction(true); // reset direction because need to handshake owner -> peer.
+            }
+        }
     }
 
     ///
@@ -223,18 +271,7 @@ impl Tracer {
                 self.switch_direction(false);
                 self.sendp_tcp_finish();
 
-                match self.direction() {
-                    // prevent re-used port
-                    TracerDirection::Forward => self.inner.l4_sport += 1,
-                    TracerDirection::Backward => {
-                        let mut port = self.inner.l4_dport as u32 + 1;
-                        if port > 65535 {
-                            port = 1025;
-                        }
-                        self.inner.l4_dport = port as u16;
-                        self.switch_direction(true); // reset direction because need to handshake owner -> peer.
-                    }
-                }
+                self.reset_tcp_info();
             }
 
             self.initialize_seq_ack();
@@ -289,7 +326,7 @@ impl Tracer {
             let result = self.build_tcp_packet(TcpFlag::Ack.into(), with_payload);
             if self.sequence_enabled {
                 if with_payload.len() > 0 {
-                    if self.inner.is_reverse() {
+                    if !self.inner.is_reverse() {
                         self.l4_owner_sequence_nonce += self.inner.data().len() as u32;
                     } else {
                         self.l4_peer_sequence_nonce += self.inner.data().len() as u32;
@@ -305,14 +342,21 @@ impl Tracer {
         }
     }
 
+    pub fn send(&mut self, with_payload: &[u8], recv_ack: bool) -> Vec<Vec<u8>> {
+        self.send_advanced(with_payload, recv_ack, TcpFlag::Push | TcpFlag::Ack)
+    }
+
     ///
     /// Send a packet with application data.
     ///
-    /// An acknowledge packet will be sended when `recv_ack` flag was enabled,
-    /// but that transmission is ignored where `IPProtocol` enum is not
-    /// `IPProtocol::TCP`.
+    /// An acknowledge packet will be sended when [`recv_ack`] flag was enabled,
+    /// but that transmission is ignored where [`IPProtocol`] enum is not
+    /// [`IPProtocol::TCP`].
     ///
-    pub fn send(&mut self, with_payload: &[u8], recv_ack: bool) -> Vec<Vec<u8>> {
+    /// [`IPProtocol`]: crate::general::IPProtocol
+    /// [`IPProtocol::TCP`]: crate::general::IPProtocol::TCP
+    ///
+    pub fn send_advanced(&mut self, with_payload: &[u8], recv_ack: bool, with_flags: u8) -> Vec<Vec<u8>> {
         let mut vecs: Vec<Vec<u8>> = vec![];
         if self.proto > IPProtocol::NONE {
             if self.fragmented {
@@ -320,7 +364,7 @@ impl Tracer {
                 self.inner.rebuild_capacity(crate::general::Layer::L3);
                 let l3_snaplen = self.inner.l3_ptr().len();
                 let payload_len = with_payload.len();
-                if l3_snaplen + payload_len > 1500 {
+                if l3_snaplen + payload_len > self.inner.mtu() {
                     let mut max_payload_len = 1500 - l3_snaplen;
                     let mut start_offset = 0;
 
@@ -405,7 +449,7 @@ impl Tracer {
 
         match self.proto {
             IPProtocol::TCP => {
-                let total_pl = self.build_tcp_packet(TcpFlag::Push | TcpFlag::Ack, with_payload);
+                let total_pl = self.build_tcp_packet(with_flags, with_payload);
                 if self.record {
                     self.payloads.push(total_pl.clone());
                 }
@@ -434,9 +478,9 @@ impl Tracer {
                 }
                 vecs.push(total_pl);
             }
-            IPProtocol::ICMP => {}
+            // included ICMP.
             _ => {
-                // it is L2 session (guess)
+                // it is L2 session (guess) or unsupport IPProtocol
                 if self.inner.current_layer() <= Layer::L2 {
                     let total_pl = self.build_and_packet_raw(with_payload);
                     if self.record {
@@ -449,20 +493,38 @@ impl Tracer {
         vecs
     }
 
+    ///
+    /// Sends a TCP-reset packet. Does nothing for [`IPProtocol`] other than TCP.
+    /// If the handshake is valid, the connection is considered broken.
+    ///
+    /// [`IPProtocol`]: crate::general::IPProtocol
+    ///
     pub fn sendp_tcp_reset(&mut self) -> Vec<u8> {
-        self.connected = false;
-        let result = self.build_tcp_packet(TcpFlag::Reset | TcpFlag::Ack, &[]);
-        if self.record {
-            self.payloads.push(result.clone());
+        let mut result = vec![];
+        if self.proto == IPProtocol::TCP {
+            result = self.build_tcp_packet(TcpFlag::Reset | TcpFlag::Ack, &[]);
+            if self.record {
+                self.payloads.push(result.clone());
+            }
+            self.reset_tcp_info();
         }
         result
     }
 
+    ///
+    /// Sends a TCP-finish packet. Does nothing for [`IPProtocol`] other than TCP.
+    /// If the handshake is valid, the connection is considered broken.
+    ///
+    /// [`IPProtocol`]: crate::general::IPProtocol
+    ///
     pub fn sendp_tcp_finish(&mut self) -> Vec<u8> {
-        self.connected = false;
-        let result = self.build_tcp_packet(TcpFlag::Fin | TcpFlag::Ack, &[]);
-        if self.record {
-            self.payloads.push(result.clone());
+        let mut result = vec![];
+        if self.proto == IPProtocol::TCP {
+            result = self.build_tcp_packet(TcpFlag::Fin | TcpFlag::Ack, &[]);
+            if self.record {
+                self.payloads.push(result.clone());
+            }
+            self.reset_tcp_info();
         }
         result
     }
@@ -475,7 +537,6 @@ impl Tracer {
         self.inner.l4_tcp_option_tsecho = self.ts_echo;
 
         if let Some(os) = self.os.get(&self.inner.l4_tcp_flags) {
-            self.inner.clear_tcp_option(Some(flags));
             os.reflect_to_session(self.inner.l4_tcp_flags, &mut self.inner);
         }
 
@@ -493,8 +554,14 @@ impl Tracer {
     }
 
     fn build_and_packet(&mut self, with_payload: &[u8]) -> Vec<u8> {
+        println!("payload_len = {:?}", with_payload.len());
         self.inner.build(with_payload);
-        self.export_packet()
+        let result = self.export_packet();
+        let with_flags = self.inner.l4_tcp_flags;
+        if with_flags & TcpFlag::Fin as u8 > 0 || with_flags & TcpFlag::Reset as u8 > 0 {
+            self.reset_tcp_info();
+        }
+        result
     }
 
     fn build_and_packet_raw(&mut self, with_payload: &[u8]) -> Vec<u8> {
@@ -522,3 +589,5 @@ impl Tracer {
         }
     }
 }
+
+pub mod http_tracer;

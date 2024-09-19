@@ -1,6 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::Mutex};
+use std::{collections::HashMap, sync::Mutex};
 
 use lazy_static::lazy_static;
 use rand::{seq::SliceRandom, Rng};
@@ -276,7 +274,7 @@ impl Preset {
     /// ```
     ///
     pub fn new(os_name: &str, sig: &str) -> Self {
-        println!("os_name: {}, sig: {}", os_name, sig);
+        // println!("os_name: {}, sig: {}", os_name, sig);
         let mut spliter = sig.split(":");
         let ip_version = Self::dissect_ip_version(spliter.next().unwrap());
         let ttl = Self::dissect_ttl(spliter.next().unwrap());
@@ -558,7 +556,7 @@ impl Preset {
                 if let Some(_) = mss {
                     if perent_mss == None {
                         // mss is not defined, but need to mss ??
-                        println!("MSS is not undefined, but window size need to MSS, use default");
+                        // println!("MSS is not undefined, but window size need to MSS, use default");
                         perent_mss = Some(TcpOption::MaximumSegmentSize(1460));
                     }
 

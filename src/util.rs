@@ -1,8 +1,8 @@
-use libc::{c_int, sysctl, sysinfo, timeval, CTL_KERN};
+use libc::sysinfo;
 use std::fs::File;
 use std::io::Write;
-use std::mem::{self, MaybeUninit};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::mem::MaybeUninit;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn calc_fcs(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFFFFFF;
@@ -79,6 +79,7 @@ pub fn write_pcap(payloads: Vec<Vec<u8>>, filename: &str) -> std::io::Result<()>
     Ok(())
 }
 
+#[allow(unused)]
 pub fn get_linux_uptime() -> Result<u64, String> {
     let mut info = MaybeUninit::<sysinfo>::uninit();
     let result = unsafe { libc::sysinfo(info.as_mut_ptr()) };
@@ -88,4 +89,13 @@ pub fn get_linux_uptime() -> Result<u64, String> {
     } else {
         Err("Failed to get sysinfo".to_string())
     }
+}
+
+pub fn ipv4_to_string(ipv4: &[u8]) -> String {
+    format!("{}.{}.{}.{}", ipv4[0], ipv4[1], ipv4[2], ipv4[3])
+}
+
+#[allow(unused)]
+pub fn mac_to_string(mac: &[u8]) -> String {
+    format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02x}:{:02X}", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
 }

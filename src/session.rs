@@ -418,8 +418,8 @@ impl Session {
         }
     }
 
-    fn from_l3(session: &mut Session, etype: u16, payload: &[u8]) -> usize {
-        let mut offset = 14;
+    fn from_l3(session: &mut Session, etype: u16, _payload: &[u8]) -> usize {
+        let offset = 14;
         unsafe {
             match etype {
                 0x0800 => if session.catch_l3_ip_version_prefix() != (4, 20) {},
@@ -432,7 +432,7 @@ impl Session {
         offset
     }
 
-    fn from_l4(session: &mut Session, payload: &[u8]) -> usize {
+    fn from_l4(_session: &mut Session, _payload: &[u8]) -> usize {
         14
     }
 
@@ -890,9 +890,11 @@ impl Session {
             return;
         }
         self.rebuild_capacity(Layer::L2);
-
         self.heuristic_ip_ethertype(); // Let assume it is assigned Ipv4 or Ipv6.
-        if self.is_ether_ipv4() || self.is_ether_ipv6() {
+
+        let ipv4 = self.is_ether_ipv4();
+        let ipv6 = self.is_ether_ipv6();
+        if ipv4 || ipv6 {
             self.build_l2_intl_ethertype();
             unsafe {
                 self.modify_l3_ip_version_prefix();
@@ -900,12 +902,11 @@ impl Session {
 
                 let src_ip = self.l3_src_ip.to_owned();
                 let dst_ip = self.l3_dst_ip.to_owned();
-
                 self.modify_l3_ip_src(&src_ip);
                 self.modify_l3_ip_dst(&dst_ip);
 
-                if self.is_ether_ipv4() {
-                    self.modify_l3_ip_length(L3_IPV4_HEADER_SIZE.try_into().unwrap()); // Let assume initial length has 20 bytes
+                if ipv4 {
+                    self.modify_l3_ip_length(L3_IPV4_HEADER_SIZE as u16); // Let assume initial length has 20 bytes
 
                     self.modify_l3_ipv4_idenification(self.l3_ipv4_iden);
                     self.modify_l3_ipv4_fragment(
@@ -915,48 +916,36 @@ impl Session {
                         self.l3_fragment.3,
                     );
                     self.modify_l3_ipv4_ttl(self.l3_ipv4_ttl);
-                    self.modify_l3_ipv4_checksum(0);
-                } else if self.is_ether_ipv6() {
+                    self.capacity += L3_IPV4_HEADER_SIZE;
+                } else if ipv6 {
                     self.modify_l3_ip_length(0); // Let assume initial length payload has 0 byte
                     self.modify_l3_ipv6_flow_label(self.l3_ipv6_flow_label);
                     self.modify_l3_ipv6_hop_limit(self.l3_ipv6_hop);
-                } else {
-                    println!("What case is it?");
+                    self.capacity += L3_IPV6_HEADER_SIZE;
                 }
-
-                match self.protocol {
-                    IPProtocol::ICMP | IPProtocol::TCP | IPProtocol::UDP => {
-                        self.modify_l3_ip_protocol(self.protocol);
-                    }
-                    _ => {
-                        println!("What protocol is it?");
-                    }
-                }
-            }
-
-            if self.is_ether_ipv4() {
-                self.capacity += L3_IPV4_HEADER_SIZE;
-            } else if self.is_ether_ipv6() {
-                self.capacity += L3_IPV6_HEADER_SIZE;
             }
 
             if self.or_insert_payload(with_payload) {
-                unsafe {
-                    self.build_layer = Layer::L3;
-                    self.modify_l3_ip_length(
-                        (self.capacity - L2_ETHERNET_SIZE).try_into().unwrap(),
-                    );
+                match self.protocol {
+                    IPProtocol::ICMP | IPProtocol::TCP | IPProtocol::UDP => {
+                        unsafe {
+                            self.modify_l3_ip_protocol(self.protocol);
+                            self.modify_l3_ip_length((self.capacity - L2_ETHERNET_SIZE) as u16);
 
-                    /* The Checksum has only available on IPv4 Header. */
-                    if self.ipv4_checksum {
-                        let checksum = util::calc_checksum(&self.l3_ptr()[..L3_IPV4_HEADER_SIZE]);
-                        self.modify_l3_ipv4_checksum(checksum);
+                            /* The Checksum has only available on IPv4 Header. */
+                            if self.ipv4_checksum && ipv4 {
+                                self.modify_l3_ipv4_checksum(0);
+                                let checksum =
+                                    util::calc_checksum(&self.l3_ptr()[..L3_IPV4_HEADER_SIZE]);
+                                self.modify_l3_ipv4_checksum(checksum);
+                            }
+                        }
+                        self.build_layer = Layer::L3;
                     }
+                    _ => {}
                 }
             }
         } else {
-            // it is neither Ipv4 and Ipv6.
-            // Another ethertype.
         }
     }
     // <---------------- :end: L3 build & modify payload ---------------->

@@ -6,6 +6,9 @@ use std::ops::{BitAnd, BitOr, BitXor, Not};
 ///
 pub type FragmentInfo = (bool, bool, bool, u16);
 
+pub const ETYPE_IPV4: u16 = 0x0800;
+pub const ETYPE_IPV6: u16 = 0x86DD;
+
 #[repr(u8)]
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum IPProtocol {
